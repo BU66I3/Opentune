@@ -55,6 +55,10 @@ android {
             )
             signingConfig = if (unsignedRelease) null else (signingConfigs.findByName("release") ?: signingConfigs.getByName("debug"))
         }
+        // LOCAL ONLY: the debug build installs beside the release app, as "OpenTune Dev".
+        debug {
+            applicationIdSuffix = ".dev"
+        }
     }
 
     // One APK per processor type, so each is a third of the size, plus one

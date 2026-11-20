@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- LOCAL ONLY: the debug build's name, so it can be told from the release app. -->
+<resources>
+    <string name="app_name" translatable="false">OpenTune Dev</string>
+</resources>
