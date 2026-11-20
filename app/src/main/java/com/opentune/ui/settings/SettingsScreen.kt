@@ -475,6 +475,10 @@ private fun settingsSections(
     var lastFmDialog by remember { mutableStateOf(false) }
     var serverDialog by remember { mutableStateOf(false) }
     var listenBrainzDialog by remember { mutableStateOf(false) }
+    var musicAssistantDialog by remember { mutableStateOf(false) }
+    val musicAssistantToken by com.opentune.cast.MaServer.hasToken.collectAsState()
+    val musicAssistantAddress by com.opentune.cast.MaServer.address.collectAsState()
+    val musicAssistantFound by com.opentune.cast.MaServer.found.collectAsState()
     var sponsorBlockDialog by remember { mutableStateOf(false) }
     var update by remember { mutableStateOf<UpdateCheck.Release?>(null) }
     var showWhatsNew by remember { mutableStateOf(false) }
@@ -580,6 +584,7 @@ private fun settingsSections(
     if (lastFmDialog) LastFmDialog(onDismiss = { lastFmDialog = false })
     if (serverDialog) ServerDialog(onDismiss = { serverDialog = false })
     if (listenBrainzDialog) ListenBrainzDialog(onDismiss = { listenBrainzDialog = false })
+    if (musicAssistantDialog) MusicAssistantDialog(onDismiss = { musicAssistantDialog = false })
     if (sponsorBlockDialog) SponsorBlockDialog(onDismiss = { sponsorBlockDialog = false })
     update?.let { UpdateDialog(it, onDismiss = { update = null }) }
     if (showWhatsNew) com.opentune.ui.components.WhatsNewSheet(
@@ -1707,6 +1712,25 @@ private fun settingsSections(
                         actions = listOf(
                             ServiceAction("Sign in again") { serverDialog = true },
                             ServiceAction("Disconnect", danger = true) { Subsonic.disconnect() },
+                        ),
+                        chevron = false,
+                    )
+                },
+            ),
+        ),
+        Section(
+            "Music Assistant",
+            listOf(
+                Entry("Music Assistant", "music assistant home assistant speakers echo cast play on token server mass") {
+                    val server = musicAssistantAddress ?: musicAssistantFound?.address
+                    ServiceRow(
+                        ServiceKind.MusicAssistant, "Music Assistant",
+                        connectedAs = if (musicAssistantToken) server?.let { com.opentune.i18n.Tr.f("Connected to {0}", it.substringAfter("://")) } ?: "Connected" else null,
+                        detail = if (musicAssistantToken) "Its players show in Play on" else "Play on the speakers Music Assistant runs, seen by Home Assistant",
+                        onClick = { musicAssistantDialog = true },
+                        actions = listOf(
+                            ServiceAction("Change") { musicAssistantDialog = true },
+                            ServiceAction("Disconnect", danger = true) { com.opentune.cast.MaServer.forget() },
                         ),
                         chevron = false,
                     )

@@ -54,7 +54,7 @@ internal val SETTINGS_CATEGORIES = listOf(
         "account", "Account & integrations", "YouTube Music, Spotify, scrobbling, Discord and your other devices", Icons.Rounded.Person,
         listOf(
             "YouTube Music" to listOf("YouTube Music account", "Listen as", "Other accounts", "Add another account", "Sign out"),
-            "Connected services" to listOf("Spotify account", "Show on Discord", "Last.fm scrobbling", "ListenBrainz", "Music server"),
+            "Connected services" to listOf("Spotify account", "Show on Discord", "Last.fm scrobbling", "ListenBrainz", "Music server", "Music Assistant"),
             "Spotify" to listOf("Spotify"),
             "Other devices" to listOf("Link a device"),
         ),
@@ -176,6 +176,7 @@ internal val SECTION_HOME = mapOf(
     "Storage" to "data",
     "Your data" to "data",
     "Your music server" to "account",
+    "Music Assistant" to "account",
     "Last.fm (optional)" to "account",
     "Discord" to "account",
     "ListenBrainz (optional)" to "account",

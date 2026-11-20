@@ -57,6 +57,7 @@ object Core {
         Subsonic.init(app)
         ListenBrainz.init(app)
         com.opentune.data.discord.DiscordRpc.init(app)
+        com.opentune.cast.MaServer.init(app)
         com.opentune.data.config.HomeDismissals.init(app)
         com.opentune.data.reco.TasteModel.init(app)
         com.opentune.data.audiobooks.Audiobooks.init(app)

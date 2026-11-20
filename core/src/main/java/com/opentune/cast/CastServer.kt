@@ -39,7 +39,18 @@ object CastServer {
          * A stream on the web. [open] gives its address and headers; it's
          * asked again with `fresh = true` if the address stops working.
          */
-        class Web(override val contentType: String, val open: suspend (fresh: Boolean) -> Pair<String, Map<String, String>>) : Source
+        class Web(
+            override val contentType: String,
+            /** Written into the stream's header, for a device that names songs by their tags (Music Assistant). */
+            val tags: Mp4Tags.Tags? = null,
+            val open: suspend (fresh: Boolean) -> Pair<String, Map<String, String>>,
+        ) : Source {
+            /** The tagged header and the stream's whole length, once worked out; [NONE] if it can't be tagged. */
+            @Volatile internal var tagged: Any? = null
+        }
+
+        /** A stream that can't be tagged, so it passes through as it is. */
+        object NONE
     }
 
     private var server: ServerSocket? = null
@@ -140,7 +151,86 @@ object CastServer {
         }
     }
 
+    /** A tagged stream: [header] stands in for the first [replaced] bytes of a stream [upstream] bytes long. */
+    private class Tagged(val header: ByteArray, val replaced: Int, val upstream: Long) {
+        val length get() = upstream - replaced + header.size
+    }
+
     private fun sendWeb(out: OutputStream, source: Source.Web, range: String?, head: Boolean) {
+        val tagged = source.tags?.let { tagsFor(source, it) }
+        if (tagged != null) return sendTagged(out, source, tagged, range, head)
+        passThrough(out, source, range, head)
+    }
+
+    /** Works out [source]'s tagged header once, from its first bytes; null if it can't be tagged. */
+    private fun tagsFor(source: Source.Web, tags: Mp4Tags.Tags): Tagged? = synchronized(source) {
+        source.tagged?.let { return it as? Tagged }
+        val made = runCatching {
+            fetch(source, "bytes=0-${PROBE_BYTES - 1}", head = false) { response ->
+                val total = response.header("Content-Range")?.substringAfterLast('/')?.toLongOrNull() ?: return@fetch null
+                val bytes = response.body?.byteStream()?.use { it.readNBytesCompat(PROBE_BYTES) } ?: return@fetch null
+                val result = Mp4Tags.tag(bytes, tags)
+                if (result == null) Log.i(TAG, "stream not tagged: ${Mp4Tags.describe(bytes)}")
+                else Log.i(TAG, "stream tagged: header ${result.replaced} -> ${result.header.size} bytes of $total")
+                result?.let { Tagged(it.header, it.replaced, total) }
+            }
+        }.onFailure { Log.d(TAG, "couldn't tag a stream: ${it.message}") }.getOrNull()
+        source.tagged = made ?: Source.NONE
+        made
+    }
+
+    private fun sendTagged(out: OutputStream, source: Source.Web, t: Tagged, range: String?, head: Boolean) {
+        val span = Ranges.parse(range, t.length)
+        val (start, end) = span ?: (0L to t.length - 1)
+        val headers = linkedMapOf("Content-Type" to source.contentType, "Accept-Ranges" to "bytes") + DLNA_HEADERS +
+            mapOf("Content-Length" to "${end - start + 1}") +
+            (if (span != null) mapOf("Content-Range" to "bytes $start-$end/${t.length}") else emptyMap())
+        respond(out, if (span != null) "206 Partial Content" else "200 OK", headers)
+        if (head) return
+        val headerSize = t.header.size.toLong()
+        if (start < headerSize) out.write(t.header, start.toInt(), (minOf(end + 1, headerSize) - start).toInt())
+        if (end >= headerSize) {
+            // The rest is the stream's own bytes, past the part the header replaced.
+            val from = maxOf(start, headerSize) - headerSize + t.replaced
+            val to = end - headerSize + t.replaced
+            fetch(source, "bytes=$from-$to", head = false) { response -> response.body?.byteStream()?.use { it.copyTo(out) } }
+        }
+    }
+
+    /** Opens [source] with [range], once more with a fresh address if the old one has run out, and hands the response to [use]. */
+    private fun <T> fetch(source: Source.Web, range: String?, head: Boolean, use: (okhttp3.Response) -> T): T? {
+        var fresh = false
+        repeat(2) {
+            val (url, extra) = runBlocking { source.open(fresh) }
+            val request = Request.Builder().url(url).apply {
+                extra.forEach { (k, v) -> header(k, v) }
+                if (range != null) header("Range", range)
+                if (head) head()
+            }.build()
+            Http.client.newCall(request).execute().use { response ->
+                if (response.code == 403 || response.code == 410) {
+                    fresh = true
+                    return@repeat
+                }
+                if (!response.isSuccessful) return null
+                return use(response)
+            }
+        }
+        return null
+    }
+
+    private fun InputStream.readNBytesCompat(max: Int): ByteArray {
+        val buffer = java.io.ByteArrayOutputStream(max)
+        val chunk = ByteArray(16 * 1024)
+        while (buffer.size() < max) {
+            val n = read(chunk, 0, minOf(chunk.size, max - buffer.size()))
+            if (n < 0) break
+            buffer.write(chunk, 0, n)
+        }
+        return buffer.toByteArray()
+    }
+
+    private fun passThrough(out: OutputStream, source: Source.Web, range: String?, head: Boolean) {
         var fresh = false
         repeat(2) {
             val (url, extra) = runBlocking { source.open(fresh) }
@@ -202,6 +292,9 @@ object CastServer {
             if (sb.length > 8192) return null
         }
     }
+
+    /** How much of a stream is read to find its header; YouTube's is a few kilobytes. */
+    private const val PROBE_BYTES = 64 * 1024
 
     /** What DLNA renderers look for before they'll stream and seek. */
     private val DLNA_HEADERS = mapOf(

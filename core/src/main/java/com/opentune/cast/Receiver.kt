@@ -35,6 +35,8 @@ data class CastMedia(
     val durationMs: Long,
     /** A radio station, with no end. */
     val live: Boolean = false,
+    /** Another address for the same song, for a receiver that can't play [url] (Music Assistant's YouTube Music failing). */
+    val fallbackUrl: String? = null,
 )
 
 enum class RemoteState { IDLE, LOADING, BUFFERING, PLAYING, PAUSED, FINISHED, ERROR, GONE }

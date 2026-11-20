@@ -30,6 +30,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Cast
 import androidx.compose.material.icons.rounded.CastConnected
+import androidx.compose.material.icons.rounded.Dns
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Speaker
 import androidx.compose.material.icons.rounded.Tv
@@ -58,9 +59,9 @@ import com.opentune.ui.components.FloatingCard
 import com.opentune.ui.components.rememberHaptics
 
 /**
- * Picks a device to play on: Chromecasts and DLNA renderers (smart TVs,
- * network speakers, Kodi, VLC) on the same Wi-Fi. While casting, it shows
- * where, the device's volume and a way to stop.
+ * Picks a device to play on: Music Assistant players, then Chromecasts and DLNA
+ * renderers (smart TVs, network speakers, Kodi, VLC) on the same Wi-Fi. While
+ * casting, it shows where, the device's volume and a way to stop.
  */
 @Composable
 fun CastSheet(onDismiss: () -> Unit) {
@@ -106,9 +107,30 @@ fun CastSheet(onDismiss: () -> Unit) {
                     }
                 }
             }
+            val assistant = devices.filter { it.kind == CastTarget.Kind.MUSIC_ASSISTANT }
+            val others = devices.filter { it.kind != CastTarget.Kind.MUSIC_ASSISTANT }
+            if (assistant.isNotEmpty()) {
+                Row(Modifier.fillMaxWidth().padding(start = 10.dp, end = 4.dp, top = 8.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Rounded.Dns, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        listOf("Music Assistant", assistant.first().host).filter { it.isNotBlank() }.joinToString(" · "),
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                assistant.forEach { d ->
+                    DeviceRow(d, session?.target?.id == d.id) {
+                        haptics.press()
+                        if (session?.target?.id != d.id) Cast.connect(context, d)
+                    }
+                }
+            }
             Row(Modifier.fillMaxWidth().padding(start = 10.dp, end = 4.dp, top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    "Devices on your Wi-Fi",
+                    if (assistant.isEmpty()) "Devices on your Wi-Fi" else "Other devices on your Wi-Fi",
                     style = MaterialTheme.typography.labelLarge,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.weight(1f),
@@ -123,7 +145,7 @@ fun CastSheet(onDismiss: () -> Unit) {
                     }
                 }
             }
-            devices.forEach { d ->
+            others.forEach { d ->
                 DeviceRow(d, session?.target?.id == d.id) {
                     haptics.press()
                     if (session?.target?.id != d.id) Cast.connect(context, d)
@@ -169,7 +191,11 @@ private fun DeviceRow(device: CastTarget, current: Boolean, onClick: () -> Unit)
         Column(Modifier.weight(1f)) {
             Text(device.name, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
             Text(
-                listOfNotNull(device.model, if (device.kind == CastTarget.Kind.CHROMECAST) "Chromecast" else "DLNA").distinct().joinToString(" · "),
+                listOfNotNull(device.model, when (device.kind) {
+                    CastTarget.Kind.CHROMECAST -> "Chromecast"
+                    CastTarget.Kind.DLNA -> "DLNA"
+                    CastTarget.Kind.MUSIC_ASSISTANT -> "Music Assistant"
+                }).distinct().joinToString(" · "),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,

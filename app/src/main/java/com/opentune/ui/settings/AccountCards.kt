@@ -22,6 +22,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
 import androidx.compose.material.icons.rounded.Devices
+import androidx.compose.material.icons.rounded.Speaker
 import androidx.compose.material.icons.rounded.Dns
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -62,11 +63,12 @@ internal fun ServiceMark(kind: ServiceKind, size: androidx.compose.ui.unit.Dp = 
         ServiceKind.LastFm -> Monogram("fm", Color(0xFFD51007), Color.White, size)
         ServiceKind.ListenBrainz -> Monogram("LB", Color(0xFFEB743B), Color(0xFF353070), size)
         ServiceKind.Server -> IconMark(Icons.Rounded.Dns, MaterialTheme.colorScheme.tertiaryContainer, MaterialTheme.colorScheme.onTertiaryContainer, size)
+        ServiceKind.MusicAssistant -> IconMark(Icons.Rounded.Speaker, MaterialTheme.colorScheme.tertiaryContainer, MaterialTheme.colorScheme.onTertiaryContainer, size)
         ServiceKind.Devices -> IconMark(Icons.Rounded.Devices, MaterialTheme.colorScheme.secondaryContainer, MaterialTheme.colorScheme.onSecondaryContainer, size)
     }
 }
 
-internal enum class ServiceKind { YouTubeMusic, Spotify, Discord, LastFm, ListenBrainz, Server, Devices }
+internal enum class ServiceKind { YouTubeMusic, Spotify, Discord, LastFm, ListenBrainz, Server, MusicAssistant, Devices }
 
 @Composable
 private fun Monogram(text: String, background: Color, foreground: Color, size: androidx.compose.ui.unit.Dp) {

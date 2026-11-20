@@ -47,12 +47,13 @@ data class CastTarget(
     val port: Int = 0,
     val model: String? = null,
     val dlna: DlnaDevice? = null,
+    val ma: MaPlayerRef? = null,
 ) {
-    enum class Kind { CHROMECAST, DLNA }
+    enum class Kind { CHROMECAST, DLNA, MUSIC_ASSISTANT }
 }
 
 /**
- * Casting: finding Chromecasts and DLNA renderers on the Wi-Fi, connecting
+ * Casting: finding Chromecasts, DLNA renderers and Music Assistant players on the Wi-Fi, connecting
  * to one, and turning queue items into something it can play. The phone's
  * player keeps running, silently, as the queue's clock; see
  * [CastMirror][com.opentune.playback.CastMirror], which keeps the device in
@@ -90,9 +91,11 @@ object Cast {
             try {
                 val chromecasts = launch { findChromecasts(app) }
                 val renderers = launch(Dispatchers.IO) { findRenderers(app) }
+                val assistant = launch { findMusicAssistant(app) }
                 delay(SCAN_MS)
                 chromecasts.cancel()
                 renderers.cancel()
+                assistant.cancel()
             } finally {
                 _scanning.value = false
             }
@@ -110,6 +113,17 @@ object Cast {
                     when (target.kind) {
                         CastTarget.Kind.CHROMECAST -> Chromecast(target.name, target.host, target.port).also { it.connect() }
                         CastTarget.Kind.DLNA -> target.dlna!!.let { Dlna(it.name, it.transportUrl, it.renderingUrl) }
+                        CastTarget.Kind.MUSIC_ASSISTANT -> target.ma!!.let { ref ->
+                            val client = MaClient.forServer(ref.server, MaServer::token)
+                            client.retain()
+                            try {
+                                client.connect()
+                                MusicAssistant(target.name, ref.queueId, ref.playerId, client).also { it.attach() }
+                            } catch (e: Exception) {
+                                client.release()
+                                throw e
+                            }
+                        }
                     }
                 }
             } catch (e: Exception) {
@@ -143,6 +157,7 @@ object Cast {
     // ---- What to send ---------------------------------------------------------
 
     private val streams = ConcurrentHashMap<String, Pair<String, String>>()
+    @Volatile private var saidNoYouTubeMusic = false
 
     /**
      * [item] as the device [receiver] should get it, or null if it can't be
@@ -155,6 +170,7 @@ object Cast {
         val host = when (receiver) {
             is Chromecast -> receiver.localAddress
             is Dlna -> receiver.localAddress
+            is MusicAssistant -> receiver.localAddress
             else -> null
         } ?: return@withContext null
         val dlna = receiver is Dlna
@@ -184,10 +200,31 @@ object Cast {
             }.getOrNull()?.substringBefore(';')?.takeIf { it.startsWith("audio/") } ?: "audio/mpeg"
             return@withContext media(CastServer.publish(CastServer.Source.Web(type) { url to emptyMap() }, host), type)
         }
+        // Music Assistant fetches a YouTube song itself, by its id, so the phone isn't in the way.
+        if (receiver is MusicAssistant && com.opentune.data.isYouTubeId(id)) {
+            if (receiver.youTubeMusic()) {
+                Log.i(TAG, "${receiver.name} gets $id from Music Assistant's YouTube Music")
+                // Should MA's YouTube Music fail to play it, the song comes through the phone instead,
+                // tagged; the stream is only looked up if it's fetched.
+                val backup = CastServer.publish(
+                    CastServer.Source.Web("audio/mp4", Mp4Tags.Tags(song.title, song.artist, song.albumName)) { fresh ->
+                        youtube(id, fresh).first.let { it to StreamResolver.mediaHeadersFor(it) }
+                    },
+                    host,
+                )
+                return@withContext media(MusicAssistant.youTubeUri(id), "audio/mp4").copy(fallbackUrl = backup)
+            }
+            if (!saidNoYouTubeMusic) {
+                saidNoYouTubeMusic = true
+                Log.w(TAG, "Music Assistant has no YouTube Music provider; songs go through the phone")
+                _messages.tryEmit(com.opentune.i18n.Tr.t("Music Assistant has no YouTube Music set up, so songs play through this phone"))
+            }
+        }
         // A download plays from the phone, if the device can take its format.
         Downloads.fileFor(id)?.let { file ->
             val type = typeOf(file.extension)
             if (type != null && !(dlna && type == "audio/webm")) {
+                if (receiver is MusicAssistant) Log.i(TAG, "${receiver.name} gets $id from the download ($type)")
                 return@withContext media(CastServer.publish(CastServer.Source.OnPhone(file, type), host), type)
             }
         }
@@ -196,7 +233,10 @@ object Cast {
             Log.w(TAG, "no stream for $id", it)
             return@withContext null
         }
-        media(CastServer.publish(CastServer.Source.Web(type) { fresh -> youtube(id, fresh).first.let { it to StreamResolver.mediaHeadersFor(it) } }, host), type)
+        // Music Assistant names a song played from an address by the stream's own tags, so they're written in.
+        val tags = if (receiver is MusicAssistant && type == "audio/mp4") Mp4Tags.Tags(song.title, song.artist, song.albumName) else null
+        if (receiver is MusicAssistant) Log.i(TAG, "${receiver.name} gets $id streamed through the phone ($type, ${if (tags != null) "tagged" else "untagged"})")
+        media(CastServer.publish(CastServer.Source.Web(type, tags) { fresh -> youtube(id, fresh).first.let { it to StreamResolver.mediaHeadersFor(it) } }, host), type)
     }
 
     /** Looks up [item]'s stream ahead of time, when it's a YouTube song, so casting it starts at once. */
@@ -230,17 +270,73 @@ object Cast {
 
     // ---- Finding devices --------------------------------------------------------
 
+    /**
+     * Adds a device found. A speaker Music Assistant has taken in is listed once, as its
+     * Music Assistant player, so Home Assistant sees what plays on it.
+     */
     private fun add(target: CastTarget) {
-        _devices.update { list -> (list.filterNot { it.id == target.id } + target).sortedBy { it.name.lowercase() } }
+        _devices.update { list ->
+            val ma = target.kind == CastTarget.Kind.MUSIC_ASSISTANT
+            if (!ma && list.any { it.kind == CastTarget.Kind.MUSIC_ASSISTANT && MaPlayers.sameName(it.name, target.name) }) return@update list
+            val rest = list.filterNot { it.id == target.id || ma && it.kind != CastTarget.Kind.MUSIC_ASSISTANT && MaPlayers.sameName(it.name, target.name) }
+            (rest + target).sortedBy { it.name.lowercase() }
+        }
     }
 
     /** Chromecasts announce themselves over mDNS as `_googlecast._tcp`. */
-    private suspend fun findChromecasts(context: Context) {
+    private suspend fun findChromecasts(context: Context) = browse(context, "_googlecast._tcp") { info -> chromecastFrom(info)?.let(::add) }
+
+    /**
+     * Music Assistant servers announce themselves as `_mass._tcp`; the one set in Settings
+     * is asked straight away. Each server is asked once a scan for its players.
+     */
+    private suspend fun findMusicAssistant(context: Context) {
+        if (MaServer.token() == null) return
+        MaServer.address.value?.let { address ->
+            withContext(Dispatchers.IO) { listMaPlayers(address, null) }
+            return
+        }
+        val asked = java.util.Collections.synchronizedSet(HashSet<String>())
+        browse(context, "_mass._tcp") { info ->
+            val found = maServerFrom(info) ?: return@browse
+            MaServer.announce(found)
+            if (asked.add(MaClient.wsUrl(found.address))) scope.launch(Dispatchers.IO) { listMaPlayers(found.address, found.serverId) }
+        }
+    }
+
+    private suspend fun listMaPlayers(address: String, serverId: String?) {
+        val client = MaClient.forServer(address, MaServer::token)
+        client.retain()
+        try {
+            val info = client.connect()
+            val players = client.call("players/all") as? org.json.JSONArray ?: return
+            MaPlayers.castable(players).forEach { add(MaPlayers.target(it, address, serverId ?: info.serverId)) }
+        } catch (e: Exception) {
+            Log.w(TAG, "Music Assistant at $address: ${e.message}")
+            _messages.tryEmit(
+                if (e is MaException && e.signIn) com.opentune.i18n.Tr.t("Music Assistant didn't accept the access token. Check it in Settings.")
+                else com.opentune.i18n.Tr.f("Couldn't reach Music Assistant: {0}", e.message ?: e.javaClass.simpleName),
+            )
+        } finally {
+            client.release()
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun maServerFrom(info: NsdServiceInfo): MaServer.Found? {
+        fun txt(key: String) = info.attributes[key]?.toString(Charsets.UTF_8)?.takeIf { it.isNotBlank() }
+        val port = info.port.takeIf { it > 0 } ?: MaClient.PORT
+        val address = txt("base_url") ?: info.host?.hostAddress?.let { "$it:$port" } ?: return null
+        return MaServer.Found(address, txt("server_id"), txt("server_version"))
+    }
+
+    /** Looks for [type] over mDNS for the length of a scan, handing each one found, resolved, to [found]. */
+    private suspend fun browse(context: Context, type: String, found: (NsdServiceInfo) -> Unit) {
         val nsd = context.getSystemService(Context.NSD_SERVICE) as? NsdManager ?: return
         val resolving = Mutex()
         val listener = object : NsdManager.DiscoveryListener {
             override fun onServiceFound(info: NsdServiceInfo) {
-                scope.launch { resolving.withLock { resolve(nsd, info)?.let(::chromecastFrom)?.let(::add) } }
+                scope.launch { resolving.withLock { resolve(nsd, info)?.let(found) } }
             }
             override fun onServiceLost(info: NsdServiceInfo) = Unit
             override fun onDiscoveryStarted(serviceType: String) = Unit
@@ -248,7 +344,7 @@ object Cast {
             override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) = Log.w(TAG, "mDNS search failed: $errorCode")
             override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) = Unit
         }
-        runCatching { nsd.discoverServices("_googlecast._tcp", NsdManager.PROTOCOL_DNS_SD, listener) }.onFailure { return }
+        runCatching { nsd.discoverServices(type, NsdManager.PROTOCOL_DNS_SD, listener) }.onFailure { return }
         try {
             delay(SCAN_MS)
         } finally {
