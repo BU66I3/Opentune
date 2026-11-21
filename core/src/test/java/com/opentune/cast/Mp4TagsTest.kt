@@ -79,6 +79,11 @@ class Mp4TagsTest {
                 assertEquals("bytes $from-$to/${expected.size}", it.header("Content-Range"))
                 assertArrayEquals(expected.copyOfRange(from, to + 1), it.body!!.bytes())
             }
+            // A range across the end of what was read to tag it (held in memory) and the rest (fetched).
+            val edge = 64 * 1024 - tagged.replaced + tagged.header.size
+            http.newCall(Request.Builder().url(url).header("Range", "bytes=${edge - 500}-${edge + 499}").build()).execute().use {
+                assertArrayEquals(expected.copyOfRange(edge - 500, edge + 500), it.body!!.bytes())
+            }
             // A range entirely past it.
             http.newCall(Request.Builder().url(url).header("Range", "bytes=150000-150099").build()).execute().use {
                 assertArrayEquals(expected.copyOfRange(150_000, 150_100), it.body!!.bytes())

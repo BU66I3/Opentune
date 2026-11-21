@@ -102,7 +102,7 @@ object MaServer {
                 Report(info.version, players, client.hasYouTubeMusic())
             }
         } finally {
-            client.release()
+            client.closeNow()
         }
     }
 

@@ -393,6 +393,11 @@ class MusicAssistantTest {
                 // Asked again, the same connection answers.
                 runBlocking { client.connect() }
                 assertEquals(1, server.connections.get())
+                // Let go and taken up again soon after (the scan, then a speaker picked): still the same one.
+                client.release()
+                client.retain()
+                runBlocking { client.call("players/all") }
+                assertEquals(1, server.connections.get())
             } finally {
                 client.release()
             }

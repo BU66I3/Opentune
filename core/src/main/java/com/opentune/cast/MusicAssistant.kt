@@ -114,11 +114,35 @@ class MaClient(
         }.getOrNull()
     }
 
-    fun retain() = synchronized(this) { users++ }
+    /** Closes the connection a while after its last user lets it go. */
+    private var closing: Job? = null
 
-    override fun release() {
-        val last = synchronized(this) { users = (users - 1).coerceAtLeast(0); users == 0 }
-        if (last) shut()
+    fun retain() = synchronized(this) {
+        users++
+        closing?.cancel()
+        closing = null
+    }
+
+    /**
+     * Done with it, for one user. The last user's release leaves the connection open for
+     * [LINGER_MS]: the scan lets it go seconds before a speaker is picked, and opening it
+     * again meant connecting and signing in twice.
+     */
+    override fun release() = synchronized(this) {
+        users = (users - 1).coerceAtLeast(0)
+        if (users > 0) return@synchronized
+        closing?.cancel()
+        closing = scope.launch {
+            delay(LINGER_MS)
+            synchronized(this@MaClient) { if (users == 0) shut() }
+        }
+    }
+
+    /** Closes the connection now, whoever is using it (a one-off client, like Test connection's). */
+    fun closeNow() = synchronized(this) {
+        closing?.cancel()
+        closing = null
+        shut()
     }
 
     /** Opens the connection (signing in) if it isn't, and returns what the server said. */
@@ -291,6 +315,8 @@ class MaClient(
         const val DISCONNECTED = "opentune_disconnected"
         private const val CONNECT_MS = 8_000L
         private const val CALL_MS = 10_000L
+        /** How long a connection nothing uses is kept open, for the next user. */
+        private const val LINGER_MS = 30_000L
         /** Not an MA error code: a server this client can't speak to at all. */
         private const val UNSUPPORTED = -1
         private const val FIRST_RETRY_MS = 1_000L
@@ -308,7 +334,7 @@ class MaClient(
 
         /** Drops every connection, after the token or server was changed. */
         fun forgetAll() {
-            clients.values.forEach { it.shut() }
+            clients.values.forEach { it.closeNow() }
             clients.clear()
         }
 

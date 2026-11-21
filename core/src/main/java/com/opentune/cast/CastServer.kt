@@ -151,8 +151,12 @@ object CastServer {
         }
     }
 
-    /** A tagged stream: [header] stands in for the first [replaced] bytes of a stream [upstream] bytes long. */
-    private class Tagged(val header: ByteArray, val replaced: Int, val upstream: Long) {
+    /**
+     * A tagged stream: [header] stands in for the first [replaced] bytes of a stream [upstream]
+     * bytes long. [start] is the stream's first bytes as read to make the header, kept so the
+     * start of the song is served without fetching it again.
+     */
+    private class Tagged(val header: ByteArray, val replaced: Int, val upstream: Long, val start: ByteArray) {
         val length get() = upstream - replaced + header.size
     }
 
@@ -172,7 +176,7 @@ object CastServer {
                 val result = Mp4Tags.tag(bytes, tags)
                 if (result == null) Log.i(TAG, "stream not tagged: ${Mp4Tags.describe(bytes)}")
                 else Log.i(TAG, "stream tagged: header ${result.replaced} -> ${result.header.size} bytes of $total")
-                result?.let { Tagged(it.header, it.replaced, total) }
+                result?.let { Tagged(it.header, it.replaced, total, bytes) }
             }
         }.onFailure { Log.d(TAG, "couldn't tag a stream: ${it.message}") }.getOrNull()
         source.tagged = made ?: Source.NONE
@@ -190,10 +194,17 @@ object CastServer {
         val headerSize = t.header.size.toLong()
         if (start < headerSize) out.write(t.header, start.toInt(), (minOf(end + 1, headerSize) - start).toInt())
         if (end >= headerSize) {
-            // The rest is the stream's own bytes, past the part the header replaced.
-            val from = maxOf(start, headerSize) - headerSize + t.replaced
+            // The rest is the stream's own bytes, past the part the header replaced: what was
+            // read to tag it comes from memory, and only what lies beyond is fetched.
+            var from = maxOf(start, headerSize) - headerSize + t.replaced
             val to = end - headerSize + t.replaced
-            fetch(source, "bytes=$from-$to", head = false) { response -> response.body?.byteStream()?.use { it.copyTo(out) } }
+            val held = t.start.size.toLong()
+            if (from < held) {
+                val until = minOf(to + 1, held)
+                out.write(t.start, from.toInt(), (until - from).toInt())
+                from = until
+            }
+            if (from <= to) fetch(source, "bytes=$from-$to", head = false) { response -> response.body?.byteStream()?.use { it.copyTo(out) } }
         }
     }
 
