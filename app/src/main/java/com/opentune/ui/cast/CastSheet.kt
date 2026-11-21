@@ -31,6 +31,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Cast
 import androidx.compose.material.icons.rounded.CastConnected
 import androidx.compose.material.icons.rounded.Dns
+import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Speaker
 import androidx.compose.material.icons.rounded.Tv
@@ -70,6 +71,7 @@ fun CastSheet(onDismiss: () -> Unit) {
     val devices by Cast.devices.collectAsState()
     val scanning by Cast.scanning.collectAsState()
     val session by Cast.session.collectAsState()
+    val recentSaved by com.opentune.cast.RecentCasts.list.collectAsState()
     LaunchedEffect(Unit) { Cast.scan(context) }
     FloatingCard(onDismiss = onDismiss, title = "Play on", icon = Icons.Rounded.Cast) {
         Column(Modifier.verticalScroll(rememberScrollState()).animateContentSize().padding(bottom = 12.dp)) {
@@ -107,8 +109,27 @@ fun CastSheet(onDismiss: () -> Unit) {
                     }
                 }
             }
-            val assistant = devices.filter { it.kind == CastTarget.Kind.MUSIC_ASSISTANT }
-            val others = devices.filter { it.kind != CastTarget.Kind.MUSIC_ASSISTANT }
+            // The devices last cast to, at once and above the rest, as found again when they have
+            // been (the search has their current address); the one playing now is in the card above.
+            val recent = recentSaved.map { r -> devices.firstOrNull { it.id == r.id } ?: r }.filter { it.id != session?.target?.id }
+            val recentIds = recent.mapTo(HashSet()) { it.id }
+            val assistant = devices.filter { it.kind == CastTarget.Kind.MUSIC_ASSISTANT && it.id !in recentIds }
+            val others = devices.filter { it.kind != CastTarget.Kind.MUSIC_ASSISTANT && it.id !in recentIds }
+            if (recent.isNotEmpty()) {
+                Row(Modifier.fillMaxWidth().padding(start = 10.dp, end = 4.dp, top = 8.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Rounded.History, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Recent", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                recent.forEach { d ->
+                    // Not found by a search that has finished: it may be off, or on another network.
+                    val missing = !scanning && devices.none { it.id == d.id }
+                    DeviceRow(d, false, note = if (missing) "Not found just now" else null) {
+                        haptics.press()
+                        Cast.connect(context, d)
+                    }
+                }
+            }
             if (assistant.isNotEmpty()) {
                 Row(Modifier.fillMaxWidth().padding(start = 10.dp, end = 4.dp, top = 8.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                     Icon(Icons.Rounded.Dns, null, tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(16.dp))
@@ -151,7 +172,7 @@ fun CastSheet(onDismiss: () -> Unit) {
                     if (session?.target?.id != d.id) Cast.connect(context, d)
                 }
             }
-            AnimatedVisibility(devices.isEmpty(), enter = fadeIn(), exit = fadeOut()) {
+            AnimatedVisibility(assistant.isEmpty() && others.isEmpty(), enter = fadeIn(), exit = fadeOut()) {
                 Text(
                     if (scanning) "Looking for TVs, speakers and Chromecasts…" else "Nothing found. The device needs to be on and on the same Wi-Fi as this phone.",
                     style = MaterialTheme.typography.bodyMedium,
@@ -164,7 +185,7 @@ fun CastSheet(onDismiss: () -> Unit) {
 }
 
 @Composable
-private fun DeviceRow(device: CastTarget, current: Boolean, onClick: () -> Unit) {
+private fun DeviceRow(device: CastTarget, current: Boolean, note: String? = null, onClick: () -> Unit) {
     val tv = device.kind == CastTarget.Kind.DLNA && Regex("tv|bravia|samsung|lg|webos|tizen|android", RegexOption.IGNORE_CASE).containsMatchIn(device.name + " " + device.model.orEmpty())
     val icon = when {
         device.kind == CastTarget.Kind.CHROMECAST && device.model?.contains("speaker", true) != true && device.model?.contains("home", true) != true && device.model?.contains("nest audio", true) != true -> Icons.Rounded.Cast
@@ -191,7 +212,7 @@ private fun DeviceRow(device: CastTarget, current: Boolean, onClick: () -> Unit)
         Column(Modifier.weight(1f)) {
             Text(device.name, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
             Text(
-                listOfNotNull(device.model, when (device.kind) {
+                listOfNotNull(note, device.model, when (device.kind) {
                     CastTarget.Kind.CHROMECAST -> "Chromecast"
                     CastTarget.Kind.DLNA -> "DLNA"
                     CastTarget.Kind.MUSIC_ASSISTANT -> "Music Assistant"

@@ -132,7 +132,12 @@ object Cast {
                 if (_session.value?.target == target) _session.value = null
                 return@launch
             }
-            if (_session.value?.target == target) _session.value = Session(target, receiver) else receiver.close()
+            if (_session.value?.target == target) {
+                _session.value = Session(target, receiver)
+                RecentCasts.remember(target)
+            } else {
+                receiver.close()
+            }
         }
     }
 
