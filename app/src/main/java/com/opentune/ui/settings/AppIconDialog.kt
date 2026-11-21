@@ -48,7 +48,9 @@ internal enum class AppIcon(val title: String, val resource: Int) {
     Gold("Gold", R.mipmap.ic_launcher_gold),
     Neon("Neon", R.mipmap.ic_launcher_neon);
 
-    fun component(context: Context) = ComponentName(context, "${context.packageName}.icon.$name")
+    // The alias's class is named in the code's namespace (com.opentune), which a build with an
+    // application id suffix (com.opentune.dev) doesn't change; only the package it's in does.
+    fun component(context: Context) = ComponentName(context, "${com.opentune.MainActivity::class.java.name.substringBeforeLast('.')}.icon.$name")
     companion object {
         fun selected(context: Context): AppIcon = entries.firstOrNull {
             context.packageManager.getComponentEnabledSetting(it.component(context)) == PackageManager.COMPONENT_ENABLED_STATE_ENABLED
