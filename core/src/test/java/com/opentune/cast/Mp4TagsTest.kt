@@ -41,13 +41,26 @@ class Mp4TagsTest {
         assertTrue(String(tagged.header, Charsets.UTF_8).contains("Fragments"))
     }
 
+    /** Some of YouTube's files carry a udta of their own, with no title; ours takes its place. */
+    @Test fun replacesAUdtaAlreadyThere() {
+        val file = stream(tagged = true)
+        val tagged = Mp4Tags.tag(file, tags)
+        assertNotNull(tagged)
+        val udta = Mp4Tags.udta(tags)
+        // The old udta (12 bytes) out, the new one in.
+        assertEquals(moovSize(file) - 12 + udta.size, moovSize(tagged!!.header))
+        assertEquals(1, Regex("udta").findAll(String(tagged.header, Charsets.ISO_8859_1)).count())
+        assertTrue(String(tagged.header, Charsets.UTF_8).contains("Night Swim"))
+        // Everything else in moov is kept, in order, ahead of the new udta.
+        val text = String(tagged.header, Charsets.ISO_8859_1)
+        assertTrue(text.indexOf("mvhd") < text.indexOf("trak") && text.indexOf("trak") < text.indexOf("mvex") && text.indexOf("mvex") < text.indexOf("udta"))
+    }
+
     @Test fun leavesAloneWhatItCantSafelyChange() {
         // Not fragmented: no mvex in moov.
         assertNull(Mp4Tags.tag(stream(fragmented = false), tags))
         // A fragment placing its data from the file's start.
         assertNull(Mp4Tags.tag(stream(absolute = true), tags))
-        // Already tagged.
-        assertNull(Mp4Tags.tag(stream(tagged = true), tags))
         // Cut off before the first fragment.
         assertNull(Mp4Tags.tag(stream().copyOfRange(0, MOOV_START + 20), tags))
         assertNull(Mp4Tags.tag(ByteArray(100) { 7 }, tags))

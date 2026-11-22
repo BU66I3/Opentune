@@ -20,7 +20,7 @@ object Mp4Tags {
     class Tagged(val header: ByteArray, val replaced: Int)
 
     /**
-     * [head], the start of a stream, with [tags] added to its `moov`; null when it isn't a
+     * [head], the start of a stream, with [tags] as its `moov`'s `udta`; null when it isn't a
      * fragmented MP4 that can safely be changed, or [head] doesn't reach past its `moov`.
      */
     fun tag(head: ByteArray, tags: Tags): Tagged? {
@@ -28,19 +28,23 @@ object Mp4Tags {
         val moov = top.firstOrNull { it.type == "moov" } ?: return null
         if (moov.end > head.size) return null
         val inside = boxes(head, moov.bodyStart, moov.end) ?: return null
-        // Not fragmented (offsets into the file would move), or already tagged.
-        if (inside.none { it.type == "mvex" } || inside.any { it.type == "udta" }) return null
+        // Not fragmented: offsets into the file would move.
+        if (inside.none { it.type == "mvex" }) return null
+        // The moov's boxes must account for all of it, to be laid out again.
+        if (inside.lastOrNull()?.end != moov.end) return null
         // A fragment that places its data by absolute offset would be moved too.
         val moof = top.firstOrNull { it.type == "moof" && it.start > moov.start } ?: return null
         if (moof.end > head.size || absoluteOffsets(head, moof)) return null
         if (moov.headerSize != 8) return null
-        val udta = udta(tags)
-        val grown = moov.end - moov.start + udta.size
-        val out = ByteArrayOutputStream(moov.end + udta.size)
+        // YouTube's own udta, when there is one (some of its files carry one, untitled), gives way to these tags.
+        val body = ByteArrayOutputStream(moov.end - moov.bodyStart)
+        inside.filter { it.type != "udta" }.forEach { body.write(head, it.start, it.end - it.start) }
+        body.write(udta(tags))
+        val out = ByteArrayOutputStream(moov.start + 8 + body.size())
         out.write(head, 0, moov.start)
-        out.write(ByteBuffer.allocate(4).putInt(grown).array())
-        out.write(head, moov.start + 4, moov.end - moov.start - 4)
-        out.write(udta)
+        out.write(ByteBuffer.allocate(4).putInt(8 + body.size()).array())
+        out.write("moov".toByteArray(Charsets.ISO_8859_1))
+        body.writeTo(out)
         return Tagged(out.toByteArray(), moov.end)
     }
 
