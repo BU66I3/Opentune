@@ -207,8 +207,9 @@ object Cast {
         }
         // Music Assistant fetches a YouTube song itself, by its id, so the phone isn't in the way.
         if (receiver is MusicAssistant && com.opentune.data.isYouTubeId(id)) {
-            if (receiver.youTubeMusic()) {
-                Log.i(TAG, "${receiver.name} gets $id from Music Assistant's YouTube Music")
+            val provider = receiver.youTubeMusic()
+            if (provider != null) {
+                Log.i(TAG, "${receiver.name} gets $id from Music Assistant's YouTube Music ($provider)")
                 // Should MA's YouTube Music fail to play it, the song comes through the phone instead,
                 // tagged; the stream is only looked up if it's fetched.
                 val backup = CastServer.publish(
@@ -217,9 +218,10 @@ object Cast {
                     },
                     host,
                 )
-                return@withContext media(MusicAssistant.youTubeUri(id), "audio/mp4").copy(fallbackUrl = backup)
+                return@withContext media(MusicAssistant.youTubeUri(id, provider), "audio/mp4").copy(fallbackUrl = backup)
             }
-            if (!saidNoYouTubeMusic) {
+            // One that failed has said so already; this is for a server without YouTube Music.
+            if (!saidNoYouTubeMusic && !receiver.youTubeMusicFailed) {
                 saidNoYouTubeMusic = true
                 Log.w(TAG, "Music Assistant has no YouTube Music provider; songs go through the phone")
                 _messages.tryEmit(com.opentune.i18n.Tr.t("Music Assistant has no YouTube Music set up, so songs play through this phone"))

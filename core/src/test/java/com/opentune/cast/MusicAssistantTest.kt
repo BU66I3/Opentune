@@ -56,6 +56,12 @@ class MusicAssistantTest {
         return status.value
     }
 
+    private fun MusicAssistant.waitForSong(mediaId: String): RemoteStatus {
+        val deadline = System.currentTimeMillis() + 3_000
+        while (System.currentTimeMillis() < deadline && status.value.mediaId != mediaId) Thread.sleep(20)
+        return status.value
+    }
+
     @Test fun loadSendsTheSongAndTurnsAutoplayOff() {
         val ma = FakeMa()
         val kitchen = MusicAssistant("Kitchen", "media_player.kitchen", "media_player.kitchen", ma)
@@ -188,14 +194,35 @@ class MusicAssistantTest {
         assertEquals("dQw4w9WgXcQ", paused.mediaId)
         // Held where it stopped, not at the 0:00 the stopped queue reports.
         assertTrue(paused.positionMs in 61_000L..63_000L)
-        // Play sends the song again and moves it back to its place.
+        // Play has MA resume it where it stopped: not sent again, which started it from the top
+        // on a speaker that can't seek.
         ma.calls.clear()
         runBlocking { kitchen.play() }
-        assertTrue(ma.calls[0].startsWith("player_queues/play_media"))
-        ma.replay(queueEvent("media_player.kitchen", "playing", "again-item", "ytmusic://track/dQw4w9WgXcQ", 0.0))
-        val deadline = System.currentTimeMillis() + 3_000
-        while (System.currentTimeMillis() < deadline && ma.calls.none { it.startsWith("player_queues/seek") }) Thread.sleep(20)
-        assertTrue(ma.calls.first { it.startsWith("player_queues/seek") }.startsWith("player_queues/seek {\"position\":6"))
+        assertEquals(listOf("player_queues/play"), ma.calls.map { it.substringBefore(' ') })
+        ma.replay(queueEvent("media_player.kitchen", "playing", "new-item", "ytmusic://track/dQw4w9WgXcQ", 62.0))
+        assertEquals("dQw4w9WgXcQ", kitchen.waitFor(RemoteState.PLAYING).mediaId)
+        assertTrue(ma.calls.none { it.startsWith("player_queues/play_media") || it.startsWith("player_queues/seek") })
+    }
+
+    /**
+     * A server with a YouTube Music provider other than the official one (a free one,
+     * `ytmusic_free`) gets songs addressed to it: sent as `ytmusic://`, MA looked for the
+     * official one, and every song failed and came through the phone.
+     */
+    @Test fun songsGoToTheYouTubeMusicProviderTheServerHas() {
+        fun p(domain: String, instance: String = domain, available: Boolean = true) =
+            JSONObject().put("domain", domain).put("instance_id", instance).put("available", available)
+        assertEquals("ytmusic_free", MusicAssistant.youTubeMusicOf(listOf(p("spotify"), p("ytmusic_free"))))
+        // The official one first, when both are working.
+        assertEquals("ytmusic", MusicAssistant.youTubeMusicOf(listOf(p("ytmusic_free"), p("ytmusic"))))
+        // One that isn't working is passed over.
+        assertEquals("ytmusic_free", MusicAssistant.youTubeMusicOf(listOf(p("ytmusic", available = false), p("ytmusic_free"))))
+        // The instance is named, so a second copy of a provider gets the song too.
+        assertEquals("ytmusic--a1b2", MusicAssistant.youTubeMusicOf(listOf(p("ytmusic", "ytmusic--a1b2"))))
+        assertNull(MusicAssistant.youTubeMusicOf(listOf(p("spotify"), p("ytmusic", available = false))))
+        assertEquals("ytmusic_free://track/dQw4w9WgXcQ", MusicAssistant.youTubeUri("dQw4w9WgXcQ", "ytmusic_free"))
+        // What it plays is known as the song sent.
+        assertTrue(MusicAssistant.sameMedia("ytmusic_free://track/dQw4w9WgXcQ", "ytmusic_free://track/dQw4w9WgXcQ"))
     }
 
     /** MA lists a YouTube Music provider that can't play the song: it comes through the phone instead. */
@@ -216,13 +243,19 @@ class MusicAssistantTest {
         assertEquals("Night Swim", track.getString("name"))
         assertEquals(RemoteState.LOADING, kitchen.status.value.state)
         // From then on, songs for this speaker come through the phone.
-        assertFalse(runBlocking { kitchen.youTubeMusic() })
+        assertNull(runBlocking { kitchen.youTubeMusic() })
+        // The same song sent again (after a stop) doesn't try YouTube Music first.
+        ma.calls.clear()
+        runBlocking { kitchen.load(media().copy(fallbackUrl = backup), 0, play = true) }
+        val again = ma.calls.filter { it.startsWith("player_queues/play_media") }
+        assertEquals(1, again.size)
+        assertTrue("ytmusic://" !in again[0] && backup in again[0])
     }
 
-    /** A player that can't seek (an Echo Show) says so once; no more seeks are sent to it. */
+    /** A player that turns seeking down as unsupported is asked once; no more seeks are sent to it. */
     @Test fun aPlayerThatCantSeekIsAskedOnce() {
         val ma = FakeMa()
-        ma.refuse = { line -> if (line.startsWith("player_queues/seek")) MaException(12, "Invalid or unsupported command.") else null }
+        ma.refuse = { line -> if (line.startsWith("player_queues/seek")) MaException(9, "Unsupported feature") else null }
         val kitchen = MusicAssistant("Kitchen", "media_player.kitchen", "media_player.kitchen", ma)
         runBlocking {
             kitchen.attach()
@@ -231,6 +264,123 @@ class MusicAssistantTest {
             kitchen.seek(60_000)
         }
         assertEquals(1, ma.calls.count { it.startsWith("player_queues/seek") })
+    }
+
+    /**
+     * MA turns a seek down with its catch-all "invalid command" while a song is starting. That
+     * once turned seeking off for good (an Echo Show seemed unable to); now the seek a song
+     * starts with is tried again, and later seeks still go.
+     */
+    @Test fun aSeekTurnedDownAsTheSongStartsIsTriedAgain() {
+        val ma = FakeMa()
+        var refusals = 1
+        ma.refuse = { line -> if (line.startsWith("player_queues/seek") && refusals-- > 0) MaException(12, "Invalid or unsupported command.") else null }
+        val kitchen = MusicAssistant("Kitchen", "media_player.kitchen", "media_player.kitchen", ma)
+        runBlocking {
+            kitchen.attach()
+            kitchen.load(media(), 42_000, play = false)
+        }
+        ma.replay(queueEvent("media_player.kitchen", "playing", "new-item", "ytmusic://track/dQw4w9WgXcQ", 0.0))
+        val deadline = System.currentTimeMillis() + 5_000
+        while (System.currentTimeMillis() < deadline && ma.calls.count { it.startsWith("player_queues/seek") } < 2) Thread.sleep(20)
+        val seeks = ma.calls.filter { it.startsWith("player_queues/seek") }
+        assertEquals(2, seeks.size)
+        assertTrue(seeks.all { "\"position\":42" in it })
+        runBlocking { kitchen.seek(90_000) }
+        assertTrue(ma.calls.last { it.startsWith("player_queues/seek") }.contains("\"position\":90"))
+    }
+
+    /** Sent paused, then played while its seek waits for MA: it isn't paused once the seek goes. */
+    @Test fun playedWhileTheStartingSeekWaitsStaysPlaying() {
+        val ma = FakeMa()
+        var refusals = 1
+        ma.refuse = { line -> if (line.startsWith("player_queues/seek") && refusals-- > 0) MaException(12, "Invalid or unsupported command.") else null }
+        val kitchen = MusicAssistant("Kitchen", "media_player.kitchen", "media_player.kitchen", ma)
+        runBlocking {
+            kitchen.attach()
+            kitchen.load(media(), 42_000, play = false)
+        }
+        ma.replay(queueEvent("media_player.kitchen", "playing", "new-item", "ytmusic://track/dQw4w9WgXcQ", 0.0))
+        // The first seek is turned down; play is pressed before the next try.
+        var deadline = System.currentTimeMillis() + 3_000
+        while (System.currentTimeMillis() < deadline && ma.calls.none { it.startsWith("player_queues/seek") }) Thread.sleep(20)
+        runBlocking { kitchen.play() }
+        deadline = System.currentTimeMillis() + 5_000
+        while (System.currentTimeMillis() < deadline && ma.calls.count { it.startsWith("player_queues/seek") } < 2) Thread.sleep(20)
+        Thread.sleep(300)
+        val afterPlay = ma.calls.dropWhile { !it.startsWith("player_queues/play ") && it != "player_queues/play" }
+        assertTrue(afterPlay.isNotEmpty())
+        assertTrue(afterPlay.none { it.startsWith("player_queues/pause") })
+    }
+
+    /**
+     * Cast again while the speaker still plays the same song from before: the old item isn't
+     * taken for the one sent, and the new one turning up later isn't taken for the speaker
+     * moving on to the next song (the phone jumped ahead while the speaker started it over).
+     */
+    @Test fun castingTheSongAlreadyPlayingWaitsForTheNewItem() {
+        val ma = FakeMa()
+        val kitchen = MusicAssistant("Kitchen", "media_player.kitchen", "media_player.kitchen", ma)
+        val a = media("songA")
+        runBlocking { kitchen.attach() }
+        ma.replay(queueEvent("media_player.kitchen", "playing", "old-a", "ytmusic://track/songA", 108.0))
+        Thread.sleep(200)
+        runBlocking {
+            kitchen.load(a, 2_000, play = false)
+            kitchen.preload(media("songB"))
+        }
+        // The old item, still playing: not ours, so not the song at 1:48.
+        ma.replay(queueEvent("media_player.kitchen", "playing", "old-a", "ytmusic://track/songA", 110.0))
+        Thread.sleep(200)
+        assertEquals(RemoteState.LOADING, kitchen.status.value.state)
+        // The new item: ours, song A, not song B.
+        ma.replay(queueEvent("media_player.kitchen", "playing", "new-a", "ytmusic://track/songA", 0.5))
+        assertEquals(RemoteState.PLAYING, kitchen.waitFor(RemoteState.PLAYING).state)
+        assertEquals("songA", kitchen.status.value.mediaId)
+        // Started over by MA as yet another item (a seek): still song A.
+        ma.replay(queueEvent("media_player.kitchen", "playing", "again-a", "ytmusic://track/songA", 2.0))
+        Thread.sleep(200)
+        assertEquals("songA", kitchen.status.value.mediaId)
+    }
+
+    /** The speaker's own Next (or the end of a song) moves on to the phone's next song, queued after the current one. */
+    @Test fun theSpeakersNextMovesThePhoneOn() {
+        val ma = FakeMa()
+        val kitchen = MusicAssistant("Kitchen", "media_player.kitchen", "media_player.kitchen", ma)
+        val a = media("songA")
+        val b = media("songB")
+        assertTrue(kitchen.takesNext)
+        runBlocking {
+            kitchen.attach()
+            kitchen.load(a, 0, play = true)
+            // Handed over straight after the load, before MA's queue holds song A: held until it does.
+            kitchen.preload(b)
+        }
+        assertTrue(ma.calls.none { "replace_next" in it })
+        ma.replay(queueEvent("media_player.kitchen", "playing", "a-item", "ytmusic://track/songA", 5.0))
+        assertEquals("songA", kitchen.waitFor(RemoteState.PLAYING).mediaId)
+        val deadline = System.currentTimeMillis() + 3_000
+        while (System.currentTimeMillis() < deadline && ma.calls.none { "replace_next" in it }) Thread.sleep(20)
+        assertEquals(
+            """player_queues/play_media {"queue_id":"media_player.kitchen","media":["ytmusic://track/songB"],"option":"replace_next"}""",
+            ma.calls.single { "replace_next" in it },
+        )
+        // Next on the speaker: MA plays song B, and says so, so the phone goes to song B too.
+        ma.replay(queueEvent("media_player.kitchen", "playing", "b-item", "ytmusic://track/songB", 0.0))
+        assertEquals("songB", kitchen.waitForSong("songB").mediaId)
+        // The phone loads song B: already playing, so it isn't sent again.
+        val playsBefore = ma.calls.count { it.startsWith("player_queues/play_media") }
+        runBlocking { kitchen.load(b, 0, play = true) }
+        assertEquals(playsBefore, ma.calls.count { it.startsWith("player_queues/play_media") })
+        ma.replay(queueEvent("media_player.kitchen", "playing", "b-item", "ytmusic://track/songB", 1.0))
+        assertEquals("songB", kitchen.waitFor(RemoteState.PLAYING).mediaId)
+        // Previous on the speaker: back to song A's item. The phone is told it's song A, not moved on.
+        ma.replay(queueEvent("media_player.kitchen", "playing", "a-item", "ytmusic://track/songA", 0.0))
+        val back = kitchen.waitForSong("songA")
+        assertEquals(RemoteState.PLAYING, back.state)
+        val playsThen = ma.calls.count { it.startsWith("player_queues/play_media") }
+        runBlocking { kitchen.load(a, 0, play = true) }
+        assertEquals(playsThen, ma.calls.count { it.startsWith("player_queues/play_media") })
     }
 
     @Test fun aPlayerTakenAwayIsGone() {

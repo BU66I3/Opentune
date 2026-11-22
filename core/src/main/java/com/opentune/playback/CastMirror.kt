@@ -77,8 +77,12 @@ class CastMirror(private val context: Context, private val player: Player, priva
                 return@launch
             }
             r.load(media, positionMs, play)
-            // The next song's stream is looked up now, so skipping to it doesn't wait for that.
-            nextItem()?.let { Cast.warm(it) }
+            // The next song's stream is looked up now, so skipping to it doesn't wait for that;
+            // a device with a queue of its own gets the song too, for its own Next button.
+            nextItem()?.let { next ->
+                Cast.warm(next)
+                if (r.takesNext) Cast.mediaFor(context, next, r)?.let { r.preload(it) }
+            }
         }
     }
 
@@ -87,10 +91,35 @@ class CastMirror(private val context: Context, private val player: Player, priva
         return if (i == androidx.media3.common.C.INDEX_UNSET) null else player.getMediaItemAt(i)
     }
 
+    /** Moves the phone to the song in its queue with [mediaId], the one nearest the current song. */
+    private fun goTo(mediaId: String) {
+        val here = player.currentMediaItemIndex
+        val index = (0 until player.mediaItemCount)
+            .filter { player.getMediaItemAt(it).mediaId == mediaId }
+            .minByOrNull { kotlin.math.abs(it - here) } ?: return
+        player.seekTo(index, 0)
+    }
+
     private fun send(block: suspend Receiver.() -> Unit) {
         val r = receiver ?: return
         commandAt = SystemClock.elapsedRealtime()
         scope.launch { r.block() }
+        recheck()
+    }
+
+    private var recheckJob: Job? = null
+
+    /**
+     * Reports in the moments after a command are passed over; a device that then says nothing
+     * more (an Echo Show that didn't take a play, so stayed paused) left the phone showing what
+     * was asked of it. Once that time is up, what the device last said is gone over again.
+     */
+    private fun recheck() {
+        recheckJob?.cancel()
+        recheckJob = scope.launch {
+            kotlinx.coroutines.delay(SETTLE_MS + 200)
+            receiver?.status?.value?.let(::onRemote)
+        }
     }
 
     private inline fun follow(block: () -> Unit) {
@@ -126,8 +155,13 @@ class CastMirror(private val context: Context, private val player: Player, priva
             return
         }
         val current = player.currentMediaItem?.mediaId
-        if (s.mediaId != null && s.mediaId != current) return
         val settling = SystemClock.elapsedRealtime() - commandAt < SETTLE_MS
+        if (s.mediaId != null && s.mediaId != current) {
+            // A device with a queue of its own went to another of the phone's songs by itself
+            // (its Next or Previous): the phone goes there too, and the device keeps playing it.
+            if (r.takesNext && !settling && s.state == RemoteState.PLAYING) goTo(s.mediaId)
+            return
+        }
         when (s.state) {
             RemoteState.LOADING, RemoteState.BUFFERING -> {
                 if (player.playWhenReady) {
