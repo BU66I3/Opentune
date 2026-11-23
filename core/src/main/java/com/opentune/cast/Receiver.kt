@@ -3,7 +3,11 @@ package com.opentune.cast
 import android.os.SystemClock
 import kotlinx.coroutines.flow.StateFlow
 
-/** Something that plays what's cast to it: a Chromecast or a DLNA renderer. */
+/**
+ * Something that plays what's cast to it: a Chromecast, a DLNA renderer or a Music Assistant
+ * player. [CastMirror][com.opentune.playback.CastMirror] keeps the first two in step with the
+ * phone's player; Music Assistant keeps the queue itself once handed it (see [MusicAssistant]).
+ */
 interface Receiver {
     val name: String
 
@@ -18,15 +22,6 @@ interface Receiver {
 
     /** Its own volume, 0 to 1. */
     suspend fun setVolume(level: Float)
-
-    /**
-     * Whether it keeps a queue of its own that should hold the phone's next song too, so its
-     * own Next button (and the end of a song) can move on to it: Music Assistant.
-     */
-    val takesNext: Boolean get() = false
-
-    /** The phone's next song, for a receiver that [takesNext]. */
-    suspend fun preload(media: CastMedia) = Unit
 
     /** Stops it playing and lets it go. */
     fun close()

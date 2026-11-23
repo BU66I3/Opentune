@@ -167,9 +167,11 @@ object Cast {
     /**
      * [item] as the device [receiver] should get it, or null if it can't be
      * cast. Most songs go through [CastServer]; a radio station is handed
-     * over as it is.
+     * over as it is. With [lookUpNow] false, a YouTube song's stream is only
+     * looked up when the device fetches it: for the many songs a Music
+     * Assistant hand-off sends at once.
      */
-    suspend fun mediaFor(context: Context, item: MediaItem, receiver: Receiver): CastMedia? = withContext(Dispatchers.IO) {
+    suspend fun mediaFor(context: Context, item: MediaItem, receiver: Receiver, lookUpNow: Boolean = true): CastMedia? = withContext(Dispatchers.IO) {
         val id = item.mediaId
         val song = item.toSong()
         val host = when (receiver) {
@@ -209,7 +211,7 @@ object Cast {
         if (receiver is MusicAssistant && com.opentune.data.isYouTubeId(id)) {
             val provider = receiver.youTubeMusic()
             if (provider != null) {
-                Log.i(TAG, "${receiver.name} gets $id from Music Assistant's YouTube Music ($provider)")
+                if (lookUpNow) Log.i(TAG, "${receiver.name} gets $id from Music Assistant's YouTube Music ($provider)")
                 // Should MA's YouTube Music fail to play it, the song comes through the phone instead,
                 // tagged; the stream is only looked up if it's fetched.
                 val backup = CastServer.publish(
@@ -235,14 +237,15 @@ object Cast {
                 return@withContext media(CastServer.publish(CastServer.Source.OnPhone(file, type), host), type)
             }
         }
-        // A YouTube song: AAC in MP4, which every device plays, through the phone.
-        val type = runCatching { youtube(id, fresh = false).second }.getOrElse {
+        // A YouTube song: AAC in MP4, which every device plays, through the phone. Not looked up
+        // yet, it's taken as that: AAC is what's asked for first.
+        val type = if (!lookUpNow) "audio/mp4" else runCatching { youtube(id, fresh = false).second }.getOrElse {
             Log.w(TAG, "no stream for $id", it)
             return@withContext null
         }
         // Music Assistant names a song played from an address by the stream's own tags, so they're written in.
         val tags = if (receiver is MusicAssistant && type == "audio/mp4") Mp4Tags.Tags(song.title, song.artist, song.albumName) else null
-        if (receiver is MusicAssistant) Log.i(TAG, "${receiver.name} gets $id streamed through the phone ($type, ${if (tags != null) "tagged" else "untagged"})")
+        if (receiver is MusicAssistant && lookUpNow) Log.i(TAG, "${receiver.name} gets $id streamed through the phone ($type, ${if (tags != null) "tagged" else "untagged"})")
         media(CastServer.publish(CastServer.Source.Web(type, tags) { fresh -> youtube(id, fresh).first.let { it to StreamResolver.mediaHeadersFor(it) } }, host), type)
     }
 

@@ -1,6 +1,14 @@
 package com.opentune.cast
 
+import androidx.media3.common.MediaItem
+import androidx.media3.common.MediaMetadata
+import androidx.media3.common.Player
+import com.opentune.playback.MusicAssistantPlayer
 import java.util.Collections
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.runBlocking
@@ -14,12 +22,17 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import org.robolectric.shadows.ShadowLooper
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35], application = android.app.Application::class)
 class MusicAssistantTest {
     /** A pretend server: records each command and answers the reads from fixed JSON. */
-    private class FakeMa(private val queues: String = QUEUES, private val players: String = PLAYERS) : MaApi {
+    private class FakeMa(
+        @Volatile var queues: String = QUEUES,
+        private val players: String = PLAYERS,
+        @Volatile var items: String = "[]",
+    ) : MaApi {
         val calls: MutableList<String> = Collections.synchronizedList(mutableListOf<String>())
         val flow = MutableSharedFlow<MaEvent>(extraBufferCapacity = 64)
         var released = 0
@@ -34,6 +47,7 @@ class MusicAssistantTest {
             refuse?.invoke(line)?.let { throw it }
             return when (command) {
                 "player_queues/all" -> JSONArray(queues)
+                "player_queues/items" -> JSONArray(items)
                 "players/all" -> JSONArray(players)
                 else -> null
             }
@@ -45,105 +59,50 @@ class MusicAssistantTest {
             val json = JSONObject(raw)
             flow.tryEmit(MaEvent(json.getString("event"), json.optString("object_id").ifBlank { null }, json.opt("data")))
         }
+
+        fun sent(command: String) = calls.filter { it.startsWith("$command ") }
     }
 
-    private fun media(id: String = "dQw4w9WgXcQ") = CastMedia(id, MusicAssistant.youTubeUri(id), "audio/mp4", "T", "A", null, null, 200_000)
+    private fun media(id: String = "dQw4w9WgXcQ", backup: String? = null) =
+        CastMedia(id, MusicAssistant.youTubeUri(id), "audio/mp4", "T", "A", null, null, 200_000, fallbackUrl = backup)
 
-    /** Waits for a status, since events are taken in on the receiver's own threads. */
-    private fun MusicAssistant.waitFor(state: RemoteState): RemoteStatus {
-        val deadline = System.currentTimeMillis() + 3_000
-        while (System.currentTimeMillis() < deadline && status.value.state != state) Thread.sleep(20)
-        return status.value
-    }
-
-    private fun MusicAssistant.waitForSong(mediaId: String): RemoteStatus {
-        val deadline = System.currentTimeMillis() + 3_000
-        while (System.currentTimeMillis() < deadline && status.value.mediaId != mediaId) Thread.sleep(20)
-        return status.value
-    }
-
-    @Test fun loadSendsTheSongAndTurnsAutoplayOff() {
-        val ma = FakeMa()
-        val kitchen = MusicAssistant("Kitchen", "media_player.kitchen", "media_player.kitchen", ma)
-        runBlocking {
-            kitchen.attach()
-            kitchen.load(media(), 42_500, play = false)
-            kitchen.setVolume(0.62f)
+    /** Waits for [check], since commands and events are handled on other threads. */
+    private fun waitUntil(ms: Long = 3_000, check: () -> Boolean) {
+        val deadline = System.currentTimeMillis() + ms
+        while (System.currentTimeMillis() < deadline && !check()) {
+            ShadowLooper.idleMainLooper()
+            Thread.sleep(20)
         }
-        fun sent() = ma.calls.filterNot { it.startsWith("player_queues/all") || it.startsWith("players/all") }
-        // Nothing to seek or pause yet: MA's play_media returns before its queue holds the song,
-        // and a seek to an empty queue is refused ("There is nothing to play here").
-        assertEquals(
-            listOf(
-                """player_queues/dont_stop_the_music {"queue_id":"media_player.kitchen","dont_stop_the_music_enabled":false}""",
-                """player_queues/play_media {"queue_id":"media_player.kitchen","media":["ytmusic://track/dQw4w9WgXcQ"],"option":"replace"}""",
-                """players/cmd/volume_set {"player_id":"media_player.kitchen","volume_level":62}""",
-            ),
-            sent(),
-        )
-        // The song turns up in the queue: now it's moved to its place and paused.
-        ma.replay(queueEvent("media_player.kitchen", "playing", "new-item", "ytmusic://track/dQw4w9WgXcQ", 0.0))
-        val deadline = System.currentTimeMillis() + 3_000
-        while (System.currentTimeMillis() < deadline && sent().size < 5) Thread.sleep(20)
-        assertEquals(
-            listOf(
-                """player_queues/seek {"position":42,"queue_id":"media_player.kitchen"}""",
-                """player_queues/pause {"queue_id":"media_player.kitchen"}""",
-            ),
-            sent().drop(3),
-        )
-        assertEquals(0.62f, kitchen.status.value.volume!!, 0.001f)
-        assertEquals("dQw4w9WgXcQ", kitchen.status.value.mediaId)
+        ShadowLooper.idleMainLooper()
     }
 
-    @Test fun followsTheQueueToTheEndOfTheSong() {
+    private fun kitchen(ma: FakeMa) = MusicAssistant("Kitchen", "media_player.kitchen", "media_player.kitchen", ma).also { runBlocking { it.attach() } }
+
+    /** The phone's queue goes over in one hand-off: the first song alone, so it starts at once, then the rest in batches. */
+    @Test fun handsOverTheQueueInOneGo() {
         val ma = FakeMa()
-        val kitchen = MusicAssistant("Kitchen", "media_player.kitchen", "media_player.kitchen", ma)
-        runBlocking {
-            kitchen.attach()
-            kitchen.load(media(), 0, play = true)
-        }
-        assertEquals(RemoteState.LOADING, kitchen.status.value.state)
-        // The old song is still reported for a moment: not taken as the new one.
-        ma.replay(queueEvent("media_player.kitchen", "playing", "old-item", "ytmusic://track/oldSong", 80.0))
-        Thread.sleep(100)
-        assertEquals(RemoteState.LOADING, kitchen.status.value.state)
-        // Then MA's item for the song sent, with its provider instance in the scheme.
-        ma.replay(queueEvent("media_player.kitchen", "playing", "new-item", "ytmusic--x7Qk://track/dQw4w9WgXcQ", 3.0))
-        val playing = kitchen.waitFor(RemoteState.PLAYING)
-        assertEquals("dQw4w9WgXcQ", playing.mediaId)
-        assertTrue(playing.positionMs in 3_000L..4_000L)
-        // Another queue's events are none of its business.
-        ma.replay(queueEvent("media_player.lounge", "paused", "x", "ytmusic://track/other", 1.0))
-        ma.replay("""{"event":"queue_time_updated","object_id":"media_player.lounge","data":99}""")
-        ma.replay("""{"event":"queue_time_updated","object_id":"media_player.kitchen","data":61.5}""")
-        Thread.sleep(100)
-        assertEquals(RemoteState.PLAYING, kitchen.status.value.state)
-        assertEquals(61_500L, kitchen.status.value.positionMs)
-        // Paused from Home Assistant.
-        ma.replay(queueEvent("media_player.kitchen", "paused", "new-item", "ytmusic://track/dQw4w9WgXcQ", 61.5))
-        assertEquals(RemoteState.PAUSED, kitchen.waitFor(RemoteState.PAUSED).state)
-        ma.replay("""{"event":"player_updated","object_id":"media_player.kitchen","data":{"player_id":"media_player.kitchen","available":true,"playback_state":"paused","volume_level":35}}""")
-        Thread.sleep(100)
-        assertEquals(0.35f, kitchen.status.value.volume!!, 0.001f)
-        // Played to the end: the queue stops on the same item, marked ended.
-        ma.replay(queueEvent("media_player.kitchen", "playing", "new-item", "ytmusic://track/dQw4w9WgXcQ", 190.0))
-        ma.replay(queueEvent("media_player.kitchen", "idle", "new-item", "ytmusic://track/dQw4w9WgXcQ", 0.0, ended = true))
-        val done = kitchen.waitFor(RemoteState.FINISHED)
-        assertEquals(RemoteState.FINISHED, done.state)
-        assertEquals("dQw4w9WgXcQ", done.mediaId)
+        val kitchen = kitchen(ma)
+        val songs = (1..60).map { media("song%07d".format(it)) }
+        runBlocking { kitchen.handOff(songs, 0) }
+        val plays = ma.sent("player_queues/play_media").map { JSONObject(it.substringAfter(' ')) }
+        assertEquals(listOf("replace", "add", "add", "add"), plays.map { it.getString("option") })
+        assertEquals(listOf(1, 25, 25, 9), plays.map { it.getJSONArray("media").length() })
+        assertEquals("ytmusic://track/song0000001", plays[0].getJSONArray("media").getString(0))
+        assertEquals("ytmusic://track/song0000060", plays[3].getJSONArray("media").getString(8))
+        // Started from the top: nothing to seek.
+        Thread.sleep(200)
+        assertTrue(ma.sent("player_queues/seek").isEmpty())
+        // Music Assistant's own autoplay is left as the owner has it.
+        assertTrue(ma.calls.none { it.startsWith("player_queues/dont_stop_the_music") })
     }
 
     @Test fun aSongFromThePhoneGoesWithItsDetails() {
         val ma = FakeMa()
-        val kitchen = MusicAssistant("Kitchen", "media_player.kitchen", "media_player.kitchen", ma)
+        val kitchen = kitchen(ma)
         val url = "http://192.168.1.20:41234/s/a2c1e1862f4e.m4a"
         val song = CastMedia("song", url, "audio/mp4", "Night Swim", "Bonobo", "Fragments", "https://lh3.example/cover.jpg", 194_000)
-        runBlocking {
-            kitchen.attach()
-            kitchen.load(song, 0, play = true)
-        }
-        val sent = JSONObject(ma.calls.single { it.startsWith("player_queues/play_media") }.substringAfter(' '))
+        runBlocking { kitchen.handOff(listOf(song), 0) }
+        val sent = JSONObject(ma.sent("player_queues/play_media").single().substringAfter(' '))
         val track = sent.getJSONArray("media").getJSONObject(0)
         assertEquals("Night Swim", track.getString("name"))
         assertEquals("track", track.getString("media_type"))
@@ -153,55 +112,272 @@ class MusicAssistantTest {
         assertEquals("Fragments", track.getJSONObject("album").getString("name"))
         assertEquals(194, track.getInt("duration"))
         assertEquals("https://lh3.example/cover.jpg", track.getJSONObject("metadata").getJSONArray("images").getJSONObject(0).getString("path"))
-        // MA's own item for it, `builtin://track/<address>`, is taken as the song sent.
-        ma.replay(queueEvent("media_player.kitchen", "playing", "url-item", "builtin://track/$url", 1.0))
-        assertEquals("song", kitchen.waitFor(RemoteState.PLAYING).mediaId)
     }
 
     @Test fun aServerThatWontTakeDetailsGetsTheAddress() {
         val ma = FakeMa()
         ma.refuse = { line -> if (line.startsWith("player_queues/play_media") && "\"name\"" in line) MaException(3, "Invalid data") else null }
-        val kitchen = MusicAssistant("Kitchen", "media_player.kitchen", "media_player.kitchen", ma)
+        val kitchen = kitchen(ma)
         val url = "http://192.168.1.20:41234/s/a2c1e1862f4e.m4a"
         val song = CastMedia("song", url, "audio/mp4", "Night Swim", "Bonobo", null, "https://lh3.example/cover.jpg", 194_000)
-        runBlocking {
-            kitchen.attach()
-            kitchen.load(song, 0, play = true)
-            kitchen.load(song.copy(id = "next"), 0, play = true)
-        }
-        val plays = ma.calls.filter { it.startsWith("player_queues/play_media") }
+        runBlocking { kitchen.handOff(listOf(song, song.copy(id = "next")), 0) }
+        val plays = ma.sent("player_queues/play_media")
         // Turned down once with its details, then the address alone, and from then on the address alone.
         assertEquals(3, plays.size)
         assertTrue("\"name\"" in plays[0])
         assertTrue(plays[1].endsWith(""""media":["$url"],"option":"replace"}"""))
-        assertTrue(plays[2].endsWith(""""media":["$url"],"option":"replace"}"""))
-        assertEquals(RemoteState.LOADING, kitchen.status.value.state)
+        assertTrue(plays[2].endsWith(""""media":["$url"],"option":"add"}"""))
     }
 
-    /** A player that stops rather than pauses: MA's queue goes idle, without `ended`. That isn't the end of the song. */
-    @Test fun pausingIsNotTheEndOfTheSong() {
+    /** MA lists a YouTube Music provider that can't play the songs: they come through the phone instead. */
+    @Test fun aFailingYouTubeMusicFallsBackToThePhone() {
         val ma = FakeMa()
-        val kitchen = MusicAssistant("Kitchen", "media_player.kitchen", "media_player.kitchen", ma)
+        ma.refuse = { line -> if ("ytmusic://" in line) MaException(8, "There is nothing to play here.") else null }
+        val kitchen = kitchen(ma)
+        val songs = (1..3).map { media("song%07d".format(it), backup = "http://192.168.1.20:41234/s/backup$it.m4a").copy(title = "Song $it") }
+        runBlocking { kitchen.handOff(songs, 0) }
+        val plays = ma.sent("player_queues/play_media").map { JSONObject(it.substringAfter(' ')) }
+        // YouTube Music tried for the first, then the phone's addresses for it and the rest.
+        assertEquals(3, plays.size)
+        assertEquals("ytmusic://track/song0000001", plays[0].getJSONArray("media").getString(0))
+        assertEquals("http://192.168.1.20:41234/s/backup1.m4a", plays[1].getJSONArray("media").getJSONObject(0).getString("item_id"))
+        assertEquals("Song 1", plays[1].getJSONArray("media").getJSONObject(0).getString("name"))
+        assertEquals("add", plays[2].getString("option"))
+        assertEquals(2, plays[2].getJSONArray("media").length())
+        assertNull(runBlocking { kitchen.youTubeMusic() })
+    }
+
+    @Test fun followsTheQueue() {
+        val ma = FakeMa()
+        val kitchen = kitchen(ma)
+        ma.replay(queueEvent("media_player.kitchen", "playing", "new-item", "ytmusic--x7Qk://track/dQw4w9WgXcQ", 3.0, index = 2, shuffle = true, repeat = "all"))
+        waitUntil { kitchen.queue.value.itemId == "new-item" && kitchen.status.value.state == RemoteState.PLAYING }
+        val q = kitchen.queue.value
+        assertEquals("playing", q.state)
+        assertEquals(2, q.index)
+        assertTrue(q.shuffle)
+        assertEquals("all", q.repeat)
+        assertTrue(q.positionNow() in 3_000L..4_000L)
+        assertEquals(RemoteState.PLAYING, kitchen.status.value.state)
+        // Another queue's events are none of its business.
+        ma.replay(queueEvent("media_player.lounge", "paused", "x", "ytmusic://track/other", 1.0))
+        ma.replay("""{"event":"queue_time_updated","object_id":"media_player.lounge","data":99}""")
+        ma.replay("""{"event":"queue_time_updated","object_id":"media_player.kitchen","data":61.5}""")
+        waitUntil { kitchen.queue.value.positionMs == 61_500L }
+        assertEquals("new-item", kitchen.queue.value.itemId)
+        assertEquals(61_500L, kitchen.queue.value.positionMs)
+        // Stopped (an Echo Show stops rather than pauses): 0:00 reported, held where it was.
+        ma.replay(queueEvent("media_player.kitchen", "idle", "new-item", "ytmusic://track/dQw4w9WgXcQ", 0.0))
+        waitUntil { kitchen.queue.value.state == "idle" }
+        assertTrue(kitchen.queue.value.positionMs in 61_500L..63_000L)
+        ma.replay("""{"event":"player_updated","object_id":"media_player.kitchen","data":{"player_id":"media_player.kitchen","available":true,"volume_level":35}}""")
+        waitUntil { kitchen.status.value.volume == 0.35f }
+        assertEquals(0.35f, kitchen.status.value.volume!!, 0.001f)
+    }
+
+    @Test fun readsTheQueuesSongs() {
+        val ma = FakeMa(items = ITEMS)
+        val kitchen = kitchen(ma)
+        val items = kitchen.items.value
+        assertEquals(listOf("i1", "i2", "i3"), items.map { it.id })
+        assertEquals("cccccccccc3", items[2].youTubeId)
+        assertEquals("Third", items[2].title)
+        assertEquals("Bonobo, Totally Enormous Extinct Dinosaurs", items[2].artist)
+        assertEquals("Fragments", items[2].album)
+        assertEquals("https://img.example/i3.jpg", items[2].imageUrl)
+        assertEquals(185_000L, items[2].durationMs)
+        assertNull(items[1].youTubeId)
+        // The songs changed on the speaker: read again.
+        ma.items = JSONArray(ITEMS).apply { remove(1) }.toString()
+        ma.replay("""{"event":"queue_items_updated","object_id":"media_player.kitchen","data":{"queue_id":"media_player.kitchen","state":"playing","items":2}}""")
+        waitUntil { kitchen.items.value.size == 2 }
+        assertEquals(listOf("i1", "i3"), kitchen.items.value.map { it.id })
+        assertNull(MusicAssistant.youTubeIdOf("ytmusic://track/short"))
+        assertEquals("dQw4w9WgXcQ", MusicAssistant.youTubeIdOf("ytmusic_free--C2P9fad2://track/dQw4w9WgXcQ"))
+    }
+
+    /** MA turns a seek down while the song handed over is starting: it's tried again once it's under way. */
+    @Test fun aHandOffStartsWhereThePhoneWas() {
+        val ma = FakeMa()
+        var refusals = 1
+        ma.refuse = { line -> if (line.startsWith("player_queues/seek") && refusals-- > 0) MaException(12, "Invalid or unsupported command.") else null }
+        val kitchen = kitchen(ma)
+        runBlocking { kitchen.handOff(listOf(media()), 42_000) }
+        ma.replay(queueEvent("media_player.kitchen", "playing", "new-item", "ytmusic://track/dQw4w9WgXcQ", 0.0))
+        waitUntil(5_000) { ma.sent("player_queues/seek").size >= 2 }
+        val seeks = ma.sent("player_queues/seek")
+        assertEquals(2, seeks.size)
+        assertTrue(seeks.all { "\"position\":4" in it })
+        // A later seek still goes: the refusal was only for the moment.
+        runBlocking { kitchen.seek(90_000) }
+        assertTrue(ma.sent("player_queues/seek").last().contains("\"position\":90"))
+    }
+
+    /** A player that turns seeking down as unsupported is asked once; no more seeks are sent to it. */
+    @Test fun aPlayerThatCantSeekIsAskedOnce() {
+        val ma = FakeMa()
+        ma.refuse = { line -> if (line.startsWith("player_queues/seek")) MaException(9, "Unsupported feature") else null }
+        val kitchen = kitchen(ma)
         runBlocking {
-            kitchen.attach()
-            kitchen.load(media(), 0, play = true)
+            kitchen.seek(30_000)
+            kitchen.seek(60_000)
         }
-        ma.replay(queueEvent("media_player.kitchen", "playing", "new-item", "ytmusic://track/dQw4w9WgXcQ", 61.0))
-        kitchen.waitFor(RemoteState.PLAYING)
-        ma.replay(queueEvent("media_player.kitchen", "idle", "new-item", "ytmusic://track/dQw4w9WgXcQ", 0.0, ended = false))
-        val paused = kitchen.waitFor(RemoteState.PAUSED)
-        assertEquals(RemoteState.PAUSED, paused.state)
-        assertEquals("dQw4w9WgXcQ", paused.mediaId)
-        // Held where it stopped, not at the 0:00 the stopped queue reports.
-        assertTrue(paused.positionMs in 61_000L..63_000L)
-        // Play has MA resume it where it stopped: not sent again, which started it from the top
-        // on a speaker that can't seek.
+        assertEquals(1, ma.sent("player_queues/seek").size)
+    }
+
+    @Test fun commandsGoToTheQueue() {
+        val ma = FakeMa()
+        val kitchen = kitchen(ma)
         ma.calls.clear()
-        runBlocking { kitchen.play() }
-        assertEquals(listOf("player_queues/play"), ma.calls.map { it.substringBefore(' ') })
-        ma.replay(queueEvent("media_player.kitchen", "playing", "new-item", "ytmusic://track/dQw4w9WgXcQ", 62.0))
-        assertEquals("dQw4w9WgXcQ", kitchen.waitFor(RemoteState.PLAYING).mediaId)
-        assertTrue(ma.calls.none { it.startsWith("player_queues/play_media") || it.startsWith("player_queues/seek") })
+        runBlocking {
+            kitchen.play()
+            kitchen.pause()
+            kitchen.next()
+            kitchen.previous()
+            kitchen.playIndex(3, 30_000)
+            kitchen.remove("i2")
+            kitchen.move("i3", -1)
+            kitchen.shuffle(true)
+            kitchen.repeat("one")
+            kitchen.setVolume(0.62f)
+            kitchen.add(listOf(media("aaaaaaaaaa1"), media("bbbbbbbbbb2")), next = true)
+        }
+        assertEquals(
+            listOf(
+                """player_queues/play {"queue_id":"media_player.kitchen"}""",
+                """player_queues/pause {"queue_id":"media_player.kitchen"}""",
+                """player_queues/next {"queue_id":"media_player.kitchen"}""",
+                """player_queues/previous {"queue_id":"media_player.kitchen"}""",
+                """player_queues/play_index {"index":3,"seek_position":30,"queue_id":"media_player.kitchen"}""",
+                """player_queues/delete_item {"item_id_or_index":"i2","queue_id":"media_player.kitchen"}""",
+                """player_queues/move_item {"queue_item_id":"i3","pos_shift":-1,"queue_id":"media_player.kitchen"}""",
+                """player_queues/shuffle {"shuffle_enabled":true,"queue_id":"media_player.kitchen"}""",
+                """player_queues/repeat {"repeat_mode":"one","queue_id":"media_player.kitchen"}""",
+                """players/cmd/volume_set {"player_id":"media_player.kitchen","volume_level":62}""",
+                """player_queues/play_media {"queue_id":"media_player.kitchen","media":["ytmusic://track/aaaaaaaaaa1","ytmusic://track/bbbbbbbbbb2"],"option":"next"}""",
+            ),
+            ma.calls.toList(),
+        )
+    }
+
+    @Test fun aPlayerTakenAwayIsGone() {
+        val ma = FakeMa()
+        val kitchen = kitchen(ma)
+        ma.replay("""{"event":"player_removed","object_id":"media_player.kitchen","data":null}""")
+        waitUntil { kitchen.status.value.state == RemoteState.GONE }
+        assertEquals(RemoteState.GONE, kitchen.status.value.state)
+    }
+
+    @Test fun aRefusedTokenEndsTheCastWithoutRetrying() {
+        val ma = FakeMa()
+        val kitchen = kitchen(ma)
+        ma.fail = MaException(23, "Invalid or expired token")
+        runBlocking { kitchen.handOff(listOf(media(), media("bbbbbbbbbb2")), 0) }
+        assertEquals(RemoteState.GONE, kitchen.status.value.state)
+        assertEquals(1, ma.sent("player_queues/play_media").size)
+    }
+
+    @Test fun closeStopsIt() {
+        val ma = FakeMa()
+        val kitchen = kitchen(ma)
+        kitchen.close()
+        waitUntil { ma.released > 0 }
+        assertEquals(1, ma.released)
+        assertTrue(ma.calls.any { it.startsWith("player_queues/stop") })
+    }
+
+    // ---- The session's player while casting ----------------------------------------------
+
+    private fun phoneSong(id: String) = MediaItem.Builder()
+        .setMediaId(id)
+        .setUri("https://example.com/$id")
+        .setMediaMetadata(MediaMetadata.Builder().setTitle("Song $id").setArtist("Artist").build())
+        .build()
+
+    private fun player(kitchen: MusicAssistant, scope: CoroutineScope) = MusicAssistantPlayer(kitchen, scope) { item, _ ->
+        CastMedia(item.mediaId, MusicAssistant.youTubeUri(item.mediaId), "audio/mp4", item.mediaMetadata.title.toString(), "Artist", null, null, 0)
+    }
+
+    /** Cast to a speaker already playing: the player shows its queue, where it is, and drives it. */
+    @Test fun thePlayerShowsAndDrivesTheSpeakersQueue() {
+        val ma = FakeMa(queues = playing(), items = ITEMS)
+        val kitchen = kitchen(ma)
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+        try {
+            val player = player(kitchen, scope)
+            waitUntil { player.mediaItemCount == 3 }
+            assertEquals(3, player.mediaItemCount)
+            assertEquals(2, player.currentMediaItemIndex)
+            assertEquals("cccccccccc3", player.currentMediaItem!!.mediaId)
+            assertEquals("Third", player.currentMediaItem!!.mediaMetadata.title.toString())
+            assertTrue(player.playWhenReady)
+            assertTrue(player.currentPosition in 61_000L..64_000L)
+            assertEquals(185_000L, player.duration)
+            assertEquals(40, player.deviceVolume)
+            // Paused on the phone: shown at once, and sent.
+            ma.calls.clear()
+            player.pause()
+            assertFalse(player.playWhenReady)
+            waitUntil { ma.sent("player_queues/pause").isNotEmpty() }
+            assertEquals(1, ma.sent("player_queues/pause").size)
+            // Back to the first song, from the phone's queue screen.
+            player.seekTo(0, 0)
+            waitUntil { ma.sent("player_queues/play_index").isNotEmpty() }
+            assertTrue(ma.sent("player_queues/play_index").single().contains("\"index\":0"))
+            assertEquals(0, player.currentMediaItemIndex)
+            // The phone's Next goes to the speaker's queue.
+            player.seekTo(2, 0)
+            player.seekToNextMediaItem()
+            player.seekToPrevious()
+            waitUntil { ma.sent("player_queues/previous").isNotEmpty() }
+            assertTrue(ma.calls.any { it.startsWith("player_queues/play_index") && "\"index\":2" in it })
+            // The volume keys move the speaker's volume.
+            player.setDeviceVolume(70, 0)
+            waitUntil { ma.sent("players/cmd/volume_set").isNotEmpty() }
+            assertTrue(ma.sent("players/cmd/volume_set").single().contains("\"volume_level\":70"))
+            player.release()
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    /** Cast while the phone is paused: its songs show, paused, and go over only when played. */
+    @Test fun aPausedPhonesQueueGoesOverWhenPlayed() {
+        val ma = FakeMa()
+        val kitchen = kitchen(ma)
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+        try {
+            val player = player(kitchen, scope)
+            val songs = listOf("aaaaaaaaaa1", "bbbbbbbbbb2", "cccccccccc3").map(::phoneSong)
+            player.stage(songs, 1, 30_000)
+            ShadowLooper.idleMainLooper()
+            assertEquals(3, player.mediaItemCount)
+            assertEquals("bbbbbbbbbb2", player.currentMediaItem!!.mediaId)
+            assertFalse(player.playWhenReady)
+            Thread.sleep(200)
+            assertTrue(ma.sent("player_queues/play_media").isEmpty())
+            // Played: the phone's songs from the current one go to the speaker.
+            player.play()
+            waitUntil { ma.sent("player_queues/play_media").size >= 2 }
+            val plays = ma.sent("player_queues/play_media").map { JSONObject(it.substringAfter(' ')) }
+            assertEquals("ytmusic://track/bbbbbbbbbb2", plays[0].getJSONArray("media").getString(0))
+            assertEquals("replace", plays[0].getString("option"))
+            assertEquals("ytmusic://track/cccccccccc3", plays[1].getJSONArray("media").getString(0))
+            assertTrue(player.playWhenReady)
+            // The speaker takes them up: its queue is shown, the phone's songs as the phone had them.
+            ma.items = """[
+                {"queue_item_id":"n2","name":"x","duration":200,"media_item":{"uri":"ytmusic://track/bbbbbbbbbb2","name":"x"}},
+                {"queue_item_id":"n3","name":"y","duration":200,"media_item":{"uri":"ytmusic://track/cccccccccc3","name":"y"}}
+            ]"""
+            ma.replay(queueEvent("media_player.kitchen", "playing", "n2", "ytmusic://track/bbbbbbbbbb2", 0.5, index = 0, items = 2))
+            waitUntil { player.mediaItemCount == 2 }
+            assertEquals(2, player.mediaItemCount)
+            assertEquals("Song bbbbbbbbbb2", player.currentMediaItem!!.mediaMetadata.title.toString())
+            assertEquals(Player.STATE_READY, player.playbackState)
+            player.release()
+        } finally {
+            scope.cancel()
+        }
     }
 
     /**
@@ -223,195 +399,6 @@ class MusicAssistantTest {
         assertEquals("ytmusic_free://track/dQw4w9WgXcQ", MusicAssistant.youTubeUri("dQw4w9WgXcQ", "ytmusic_free"))
         // What it plays is known as the song sent.
         assertTrue(MusicAssistant.sameMedia("ytmusic_free://track/dQw4w9WgXcQ", "ytmusic_free://track/dQw4w9WgXcQ"))
-    }
-
-    /** MA lists a YouTube Music provider that can't play the song: it comes through the phone instead. */
-    @Test fun aFailingYouTubeMusicFallsBackToThePhone() {
-        val ma = FakeMa()
-        ma.refuse = { line -> if ("ytmusic://" in line) MaException(8, "There is nothing to play here.") else null }
-        val kitchen = MusicAssistant("Kitchen", "media_player.kitchen", "media_player.kitchen", ma)
-        val backup = "http://192.168.1.20:41234/s/backup.m4a"
-        runBlocking {
-            kitchen.attach()
-            kitchen.load(media().copy(title = "Night Swim", artist = "Bonobo", imageUrl = "https://lh3.example/c.jpg", fallbackUrl = backup), 0, play = true)
-        }
-        val plays = ma.calls.filter { it.startsWith("player_queues/play_media") }
-        assertEquals(2, plays.size)
-        assertTrue("ytmusic://track/dQw4w9WgXcQ" in plays[0])
-        val track = JSONObject(plays[1].substringAfter(' ')).getJSONArray("media").getJSONObject(0)
-        assertEquals(backup, track.getString("item_id"))
-        assertEquals("Night Swim", track.getString("name"))
-        assertEquals(RemoteState.LOADING, kitchen.status.value.state)
-        // From then on, songs for this speaker come through the phone.
-        assertNull(runBlocking { kitchen.youTubeMusic() })
-        // The same song sent again (after a stop) doesn't try YouTube Music first.
-        ma.calls.clear()
-        runBlocking { kitchen.load(media().copy(fallbackUrl = backup), 0, play = true) }
-        val again = ma.calls.filter { it.startsWith("player_queues/play_media") }
-        assertEquals(1, again.size)
-        assertTrue("ytmusic://" !in again[0] && backup in again[0])
-    }
-
-    /** A player that turns seeking down as unsupported is asked once; no more seeks are sent to it. */
-    @Test fun aPlayerThatCantSeekIsAskedOnce() {
-        val ma = FakeMa()
-        ma.refuse = { line -> if (line.startsWith("player_queues/seek")) MaException(9, "Unsupported feature") else null }
-        val kitchen = MusicAssistant("Kitchen", "media_player.kitchen", "media_player.kitchen", ma)
-        runBlocking {
-            kitchen.attach()
-            kitchen.load(media(), 0, play = true)
-            kitchen.seek(30_000)
-            kitchen.seek(60_000)
-        }
-        assertEquals(1, ma.calls.count { it.startsWith("player_queues/seek") })
-    }
-
-    /**
-     * MA turns a seek down with its catch-all "invalid command" while a song is starting. That
-     * once turned seeking off for good (an Echo Show seemed unable to); now the seek a song
-     * starts with is tried again, and later seeks still go.
-     */
-    @Test fun aSeekTurnedDownAsTheSongStartsIsTriedAgain() {
-        val ma = FakeMa()
-        var refusals = 1
-        ma.refuse = { line -> if (line.startsWith("player_queues/seek") && refusals-- > 0) MaException(12, "Invalid or unsupported command.") else null }
-        val kitchen = MusicAssistant("Kitchen", "media_player.kitchen", "media_player.kitchen", ma)
-        runBlocking {
-            kitchen.attach()
-            kitchen.load(media(), 42_000, play = false)
-        }
-        ma.replay(queueEvent("media_player.kitchen", "playing", "new-item", "ytmusic://track/dQw4w9WgXcQ", 0.0))
-        val deadline = System.currentTimeMillis() + 5_000
-        while (System.currentTimeMillis() < deadline && ma.calls.count { it.startsWith("player_queues/seek") } < 2) Thread.sleep(20)
-        val seeks = ma.calls.filter { it.startsWith("player_queues/seek") }
-        assertEquals(2, seeks.size)
-        assertTrue(seeks.all { "\"position\":42" in it })
-        runBlocking { kitchen.seek(90_000) }
-        assertTrue(ma.calls.last { it.startsWith("player_queues/seek") }.contains("\"position\":90"))
-    }
-
-    /** Sent paused, then played while its seek waits for MA: it isn't paused once the seek goes. */
-    @Test fun playedWhileTheStartingSeekWaitsStaysPlaying() {
-        val ma = FakeMa()
-        var refusals = 1
-        ma.refuse = { line -> if (line.startsWith("player_queues/seek") && refusals-- > 0) MaException(12, "Invalid or unsupported command.") else null }
-        val kitchen = MusicAssistant("Kitchen", "media_player.kitchen", "media_player.kitchen", ma)
-        runBlocking {
-            kitchen.attach()
-            kitchen.load(media(), 42_000, play = false)
-        }
-        ma.replay(queueEvent("media_player.kitchen", "playing", "new-item", "ytmusic://track/dQw4w9WgXcQ", 0.0))
-        // The first seek is turned down; play is pressed before the next try.
-        var deadline = System.currentTimeMillis() + 3_000
-        while (System.currentTimeMillis() < deadline && ma.calls.none { it.startsWith("player_queues/seek") }) Thread.sleep(20)
-        runBlocking { kitchen.play() }
-        deadline = System.currentTimeMillis() + 5_000
-        while (System.currentTimeMillis() < deadline && ma.calls.count { it.startsWith("player_queues/seek") } < 2) Thread.sleep(20)
-        Thread.sleep(300)
-        val afterPlay = ma.calls.dropWhile { !it.startsWith("player_queues/play ") && it != "player_queues/play" }
-        assertTrue(afterPlay.isNotEmpty())
-        assertTrue(afterPlay.none { it.startsWith("player_queues/pause") })
-    }
-
-    /**
-     * Cast again while the speaker still plays the same song from before: the old item isn't
-     * taken for the one sent, and the new one turning up later isn't taken for the speaker
-     * moving on to the next song (the phone jumped ahead while the speaker started it over).
-     */
-    @Test fun castingTheSongAlreadyPlayingWaitsForTheNewItem() {
-        val ma = FakeMa()
-        val kitchen = MusicAssistant("Kitchen", "media_player.kitchen", "media_player.kitchen", ma)
-        val a = media("songA")
-        runBlocking { kitchen.attach() }
-        ma.replay(queueEvent("media_player.kitchen", "playing", "old-a", "ytmusic://track/songA", 108.0))
-        Thread.sleep(200)
-        runBlocking {
-            kitchen.load(a, 2_000, play = false)
-            kitchen.preload(media("songB"))
-        }
-        // The old item, still playing: not ours, so not the song at 1:48.
-        ma.replay(queueEvent("media_player.kitchen", "playing", "old-a", "ytmusic://track/songA", 110.0))
-        Thread.sleep(200)
-        assertEquals(RemoteState.LOADING, kitchen.status.value.state)
-        // The new item: ours, song A, not song B.
-        ma.replay(queueEvent("media_player.kitchen", "playing", "new-a", "ytmusic://track/songA", 0.5))
-        assertEquals(RemoteState.PLAYING, kitchen.waitFor(RemoteState.PLAYING).state)
-        assertEquals("songA", kitchen.status.value.mediaId)
-        // Started over by MA as yet another item (a seek): still song A.
-        ma.replay(queueEvent("media_player.kitchen", "playing", "again-a", "ytmusic://track/songA", 2.0))
-        Thread.sleep(200)
-        assertEquals("songA", kitchen.status.value.mediaId)
-    }
-
-    /** The speaker's own Next (or the end of a song) moves on to the phone's next song, queued after the current one. */
-    @Test fun theSpeakersNextMovesThePhoneOn() {
-        val ma = FakeMa()
-        val kitchen = MusicAssistant("Kitchen", "media_player.kitchen", "media_player.kitchen", ma)
-        val a = media("songA")
-        val b = media("songB")
-        assertTrue(kitchen.takesNext)
-        runBlocking {
-            kitchen.attach()
-            kitchen.load(a, 0, play = true)
-            // Handed over straight after the load, before MA's queue holds song A: held until it does.
-            kitchen.preload(b)
-        }
-        assertTrue(ma.calls.none { "replace_next" in it })
-        ma.replay(queueEvent("media_player.kitchen", "playing", "a-item", "ytmusic://track/songA", 5.0))
-        assertEquals("songA", kitchen.waitFor(RemoteState.PLAYING).mediaId)
-        val deadline = System.currentTimeMillis() + 3_000
-        while (System.currentTimeMillis() < deadline && ma.calls.none { "replace_next" in it }) Thread.sleep(20)
-        assertEquals(
-            """player_queues/play_media {"queue_id":"media_player.kitchen","media":["ytmusic://track/songB"],"option":"replace_next"}""",
-            ma.calls.single { "replace_next" in it },
-        )
-        // Next on the speaker: MA plays song B, and says so, so the phone goes to song B too.
-        ma.replay(queueEvent("media_player.kitchen", "playing", "b-item", "ytmusic://track/songB", 0.0))
-        assertEquals("songB", kitchen.waitForSong("songB").mediaId)
-        // The phone loads song B: already playing, so it isn't sent again.
-        val playsBefore = ma.calls.count { it.startsWith("player_queues/play_media") }
-        runBlocking { kitchen.load(b, 0, play = true) }
-        assertEquals(playsBefore, ma.calls.count { it.startsWith("player_queues/play_media") })
-        ma.replay(queueEvent("media_player.kitchen", "playing", "b-item", "ytmusic://track/songB", 1.0))
-        assertEquals("songB", kitchen.waitFor(RemoteState.PLAYING).mediaId)
-        // Previous on the speaker: back to song A's item. The phone is told it's song A, not moved on.
-        ma.replay(queueEvent("media_player.kitchen", "playing", "a-item", "ytmusic://track/songA", 0.0))
-        val back = kitchen.waitForSong("songA")
-        assertEquals(RemoteState.PLAYING, back.state)
-        val playsThen = ma.calls.count { it.startsWith("player_queues/play_media") }
-        runBlocking { kitchen.load(a, 0, play = true) }
-        assertEquals(playsThen, ma.calls.count { it.startsWith("player_queues/play_media") })
-    }
-
-    @Test fun aPlayerTakenAwayIsGone() {
-        val ma = FakeMa()
-        val kitchen = MusicAssistant("Kitchen", "media_player.kitchen", "media_player.kitchen", ma)
-        runBlocking { kitchen.attach() }
-        ma.replay("""{"event":"player_removed","object_id":"media_player.kitchen","data":null}""")
-        assertEquals(RemoteState.GONE, kitchen.waitFor(RemoteState.GONE).state)
-    }
-
-    @Test fun aRefusedTokenEndsTheCastWithoutRetrying() {
-        val ma = FakeMa()
-        val kitchen = MusicAssistant("Kitchen", "media_player.kitchen", "media_player.kitchen", ma)
-        runBlocking { kitchen.attach() }
-        ma.fail = MaException(23, "Invalid or expired token")
-        runBlocking { kitchen.load(media(), 0, play = true) }
-        assertEquals(RemoteState.GONE, kitchen.status.value.state)
-        assertEquals(1, ma.calls.count { it.startsWith("player_queues/play_media") })
-    }
-
-    @Test fun closeStopsAndPutsAutoplayBack() {
-        val ma = FakeMa()
-        val kitchen = MusicAssistant("Kitchen", "media_player.kitchen", "media_player.kitchen", ma)
-        runBlocking { kitchen.attach() }
-        kitchen.close()
-        val deadline = System.currentTimeMillis() + 3_000
-        while (System.currentTimeMillis() < deadline && ma.released == 0) Thread.sleep(20)
-        assertEquals(1, ma.released)
-        assertTrue(ma.calls.any { it.startsWith("player_queues/stop") })
-        // The queue had it on before; it's turned back on.
-        assertTrue(ma.calls.last { it.startsWith("player_queues/dont_stop_the_music") }.endsWith("\"dont_stop_the_music_enabled\":true}"))
     }
 
     @Test fun picksCastablePlayers() {
@@ -442,7 +429,6 @@ class MusicAssistantTest {
         assertTrue(MusicAssistant.sameMedia(url, url))
         assertTrue(MusicAssistant.sameMedia("builtin://track/" + java.net.URLEncoder.encode(url, "UTF-8"), url))
         assertNull(MusicAssistant.uriOf(JSONObject("""{"queue_item_id":"x","name":"y"}""")))
-        assertEquals(true, MusicAssistant.autoplayOf(JSONObject("""{"autoplay_enabled":true}""")))
     }
 
     /**
@@ -574,20 +560,49 @@ class MusicAssistantTest {
         }
     }
 
-    private fun queueEvent(queue: String, state: String, item: String, uri: String, elapsed: Double, ended: Boolean = false) = JSONObject()
+    private fun queueEvent(
+        queue: String,
+        state: String,
+        item: String,
+        uri: String,
+        elapsed: Double,
+        index: Int = 0,
+        shuffle: Boolean = false,
+        repeat: String = "off",
+        items: Int? = null,
+    ) = JSONObject()
         .put("event", "queue_updated")
         .put("object_id", queue)
         .put("data", JSONObject()
             .put("queue_id", queue)
             .put("state", state)
-            .put("ended", ended)
+            .put("current_index", index)
+            .put("shuffle_enabled", shuffle)
+            .put("repeat_mode", repeat)
             .put("elapsed_time", elapsed)
             .put("elapsed_time_last_updated", System.currentTimeMillis() / 1000.0)
+            .apply { if (items != null) put("items", items) }
             .put("current_item", JSONObject().put("queue_item_id", item).put("name", "Song").put("duration", 200)
                 .put("media_item", JSONObject().put("uri", uri))))
         .toString()
 
     private companion object {
+        /** A queue playing the third of [ITEMS], a minute in as of now. */
+        fun playing() = """[
+            {"queue_id":"media_player.kitchen","state":"playing","current_index":2,"items":3,"elapsed_time":61.0,
+             "elapsed_time_last_updated":${System.currentTimeMillis() / 1000.0},
+             "current_item":{"queue_item_id":"i3","name":"Third","media_item":{"uri":"ytmusic_free--C2P9fad2://track/cccccccccc3"}}}
+        ]"""
+
+        /** Shaped as `player_queues/items` answers: two YouTube Music songs and one from elsewhere. */
+        const val ITEMS = """[
+            {"queue_item_id":"i1","name":"First","duration":200,"media_item":{"uri":"ytmusic://track/aaaaaaaaaa1","name":"First"}},
+            {"queue_item_id":"i2","name":"Other","duration":200,"media_item":{"uri":"spotify://track/4uLU6hMCjMI75M1A2tKUQC","name":"Other"}},
+            {"queue_item_id":"i3","name":"Third","duration":185,"image":{"path":"https://img.example/i3.jpg"},
+             "media_item":{"uri":"ytmusic_free--C2P9fad2://track/cccccccccc3","name":"Third",
+              "artists":[{"name":"Bonobo"},{"name":"Totally Enormous Extinct Dinosaurs"}],"album":{"name":"Fragments"}}}
+        ]"""
+
         /** Shaped as `player_queues/all` answers, cut down. */
         const val QUEUES = """[
             {"queue_id":"media_player.kitchen","display_name":"Kitchen Echo Show","state":"idle","dont_stop_the_music_enabled":true,

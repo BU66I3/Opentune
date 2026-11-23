@@ -49,7 +49,6 @@ interface MaApi {
     val events: SharedFlow<MaEvent>
     /** Sends [command] and waits for its result: a JSONObject, a JSONArray, a plain value or null. */
     suspend fun call(command: String, args: JSONObject = JSONObject()): Any?
-    /** Whether the server has a YouTube Music provider set up, so songs can be handed over by id. */
     /**
      * The YouTube Music provider the server has, as named in a song's address (`<it>://track/<id>`):
      * the official one (`ytmusic`) or another, such as a free one (`ytmusic_free`); null for none.
@@ -364,13 +363,47 @@ class MaClient(
     }
 }
 
+/** One song in a Music Assistant queue. */
+data class MaItem(
+    val id: String,
+    val uri: String?,
+    val title: String,
+    val artist: String,
+    val album: String?,
+    val imageUrl: String?,
+    val durationMs: Long,
+) {
+    /** Its YouTube id, for a song from a YouTube Music provider: one the phone can play itself. */
+    val youTubeId: String? get() = MusicAssistant.youTubeIdOf(uri)
+}
+
 /**
- * A Music Assistant player as a cast target. OpenTune hands its queue's current
- * song to the player's MA queue, one song at a time ("replace"), and the phone's
- * own player stays the queue, as with every other receiver (see
- * [CastMirror][com.opentune.playback.CastMirror]). So that MA doesn't carry on
- * with songs of its own after each one, its "don't stop the music" is turned off
- * while OpenTune is attached, and put back as it was after.
+ * A Music Assistant queue as it last said it was. [state] is "playing", "paused" or "idle";
+ * the current song was at [positionMs] when the phone's clock (elapsedRealtime) read [at].
+ */
+data class MaQueue(
+    val state: String = "idle",
+    val index: Int = -1,
+    val itemId: String? = null,
+    val positionMs: Long = 0,
+    val at: Long = 0,
+    val shuffle: Boolean = false,
+    val repeat: String = "off",
+    val count: Int = 0,
+) {
+    val playing: Boolean get() = state == "playing"
+
+    fun positionNow(now: Long = SystemClock.elapsedRealtime()): Long =
+        if (playing) positionMs + (now - at).coerceAtLeast(0) else positionMs
+}
+
+/**
+ * A Music Assistant player as a cast target. Its queue is Music Assistant's: the phone's
+ * queue is handed over once ([handOff]), and from then on OpenTune shows what the queue says
+ * and sends it commands, as Music Assistant's own apps do (the session's player while casting
+ * is [MusicAssistantPlayer][com.opentune.playback.MusicAssistantPlayer]). Keeping the queue on
+ * the phone as well, and sending the speaker one song at a time, raced it: songs started over,
+ * plays and pauses arrived out of order, and the two drifted apart.
  */
 class MusicAssistant(
     override val name: String,
@@ -381,177 +414,186 @@ class MusicAssistant(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val _status = MutableStateFlow(RemoteStatus())
     override val status: StateFlow<RemoteStatus> = _status
-    @Volatile private var loaded: CastMedia? = null
-    /** The queue item on the player when the last song was sent, and the one MA made of that song. */
-    @Volatile private var itemBefore: String? = null
-    @Volatile private var ourItem: String? = null
-    @Volatile private var currentItem: String? = null
-    /** The loaded song was seen playing, so the queue going idle after is its end. */
-    @Volatile private var played = false
-    /** When the song was sent, for the log of how long the speaker took to start it. */
-    @Volatile private var sentAt = 0L
-    @Volatile private var autoplayWas: Boolean? = null
+    private val _queue = MutableStateFlow(MaQueue())
+    /** The queue as it last said it was. */
+    val queue: StateFlow<MaQueue> = _queue
+    private val _items = MutableStateFlow<List<MaItem>>(emptyList())
+    /** The queue's songs, in the order they play. */
+    val items: StateFlow<List<MaItem>> = _items
     private var listening: Job? = null
+    private var itemsJob: Job? = null
 
     val localAddress: InetAddress? get() = (client as? MaClient)?.localAddress
 
-    /** Set once MA's YouTube Music has failed to play a song here; songs come through the phone from then on. */
+    /** Set once MA's YouTube Music has failed to play songs here; songs come through the phone from then on. */
     @Volatile var youTubeMusicFailed = false
         private set
 
-    /** Whether the server can fetch YouTube songs itself. */
     /** The server's YouTube Music provider, to send a YouTube song to by its id; null to send it through the phone. */
     suspend fun youTubeMusic(): String? = if (youTubeMusicFailed) null else client.youTubeMusicProvider()
 
-    /** Starts following the player and turns MA's own autoplay off for its queue. */
+    /** Starts following the player's queue. */
     suspend fun attach() = withContext(Dispatchers.IO) {
         // Subscribed before going on, so nothing MA says from here on is missed.
         listening = scope.launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) { client.events.collect(::onEvent) }
         refresh()
-        runCatching { client.call("player_queues/dont_stop_the_music", JSONObject().put("queue_id", queueId).put("dont_stop_the_music_enabled", false)) }
-            .onFailure { Log.w(TAG, "couldn't turn off autoplay on $name: ${it.message}") }
-        Unit
     }
 
-    /** Reads the queue and player as they are now. */
+    /** Reads the queue, its songs and the player as they are now. */
     private suspend fun refresh() {
-        val queue = runCatching { client.call("player_queues/all") as? JSONArray }.getOrNull()
-        queue?.let { all -> (0 until all.length()).map { all.getJSONObject(it) }.firstOrNull { it.optString("queue_id") == queueId } }?.let {
-            if (autoplayWas == null) autoplayWas = autoplayOf(it)
-            onQueue(it)
-        }
-        val players = runCatching { client.call("players/all") as? JSONArray }.getOrNull()
-        players?.let { all -> (0 until all.length()).map { all.getJSONObject(it) }.firstOrNull { it.optString("player_id") == playerId } }?.let(::onPlayer)
+        runCatching { client.call("player_queues/all") as? JSONArray }.getOrNull()
+            ?.let { all -> (0 until all.length()).map { all.getJSONObject(it) }.firstOrNull { it.optString("queue_id") == queueId } }
+            ?.let(::onQueue)
+        loadItems()
+        runCatching { client.call("players/all") as? JSONArray }.getOrNull()
+            ?.let { all -> (0 until all.length()).map { all.getJSONObject(it) }.firstOrNull { it.optString("player_id") == playerId } }
+            ?.let(::onPlayer)
     }
 
-    override suspend fun load(media: CastMedia, positionMs: Long, play: Boolean) = withContext(Dispatchers.IO) {
-        wantPlay = play
-        // The speaker already moved on to this song (its Next, or the end of the last one):
-        // it's playing, so it's taken as loaded rather than sent again.
-        val adopted = movedTo
-        movedTo = null
-        queuedNext = null
-        if (adopted != null && adopted.second.id == media.id) {
-            loaded = media
-            sentAt = 0L
-            ourItem = adopted.first
-            itemBefore = null
-            played = false
-            _status.value = RemoteStatus(RemoteState.BUFFERING, 0, SystemClock.elapsedRealtime(), _status.value.volume, media.id)
-            if (positionMs >= SEEK_MIN_MS || !play) scope.launch {
-                if (positionMs >= SEEK_MIN_MS) runCatching { seekOnceUnderWay(positionMs, adopted.first) }
-                if (!wantPlay) runCatching { queue("player_queues/pause") }
-            }
+    private suspend fun loadItems() {
+        val all = try {
+            client.call("player_queues/items", JSONObject().put("queue_id", queueId).put("limit", ITEMS_MAX).put("offset", 0)) as? JSONArray
+        } catch (e: Exception) {
+            Log.w(TAG, "couldn't read the queue on $name: ${e.message}")
+            return
+        } ?: return
+        _items.value = (0 until all.length()).mapNotNull { all.optJSONObject(it)?.let(::itemOf) }
+        updateStatus()
+    }
+
+    /** Reads the songs again in a moment; a hand-off changes them several times in a row. */
+    private fun reloadItems() {
+        itemsJob?.cancel()
+        itemsJob = scope.launch {
+            delay(ITEMS_SETTLE_MS)
+            loadItems()
+        }
+    }
+
+    /**
+     * Hands [songs] to the speaker as its queue, the first starting at [positionMs]. The first
+     * goes alone, so it starts at once; the rest follow in batches. Songs for MA's YouTube Music
+     * come through the phone instead if it can't play them ([CastMedia.fallbackUrl]).
+     */
+    suspend fun handOff(songs: List<CastMedia>, positionMs: Long) = withContext(Dispatchers.IO) {
+        val first = songs.firstOrNull() ?: return@withContext
+        val before = _queue.value.itemId
+        try {
+            send(listOf(first), "replace")
+        } catch (e: Exception) {
+            Log.w(TAG, "$name wouldn't play ${first.title}: ${e.message}")
+            if (e is MaException && e.signIn) _status.value = _status.value.copy(state = RemoteState.GONE, at = SystemClock.elapsedRealtime())
             return@withContext
         }
-        loaded = media
-        played = false
-        sentAt = SystemClock.elapsedRealtime()
-        itemBefore = currentItem
-        ourItem = null
-        // play_media replaces the whole queue, so nothing sent before is in it any more.
-        sent.clear()
-        _status.value = RemoteStatus(RemoteState.LOADING, positionMs, SystemClock.elapsedRealtime(), _status.value.volume, media.id)
-        try {
-            // Where to start, and whether paused, are sent once MA's queue holds the song:
-            // play_media returns before it does, and a seek to an empty queue is refused.
-            startAt = positionMs.takeIf { it >= SEEK_MIN_MS }
-            playMedia(media)
-        } catch (e: Exception) {
-            Log.w(TAG, "$name wouldn't play ${media.title}: ${e.message}")
-            _status.value = _status.value.copy(state = if (e is MaException && e.signIn) RemoteState.GONE else RemoteState.ERROR, at = SystemClock.elapsedRealtime())
-        }
-    }
-
-    override val takesNext: Boolean get() = true
-
-    /** The phone's next song, queued after the current one in MA. */
-    @Volatile private var queuedNext: CastMedia? = null
-    /**
-     * The queue item the speaker went to by itself (its Next or Previous, or the end of a song),
-     * and the song it is; loading that song then takes it as already playing.
-     */
-    @Volatile private var movedTo: Pair<String, CastMedia>? = null
-    /** The songs sent here, by the queue item MA made of each, so the speaker going back to one is known. */
-    private val sent = java.util.concurrent.ConcurrentHashMap<String, CastMedia>()
-
-    /** Puts the phone's next song after the current one, once the current one is in MA's queue. */
-    override suspend fun preload(media: CastMedia) = withContext(Dispatchers.IO) {
-        queuedNext = media
-        if (ourItem != null) sendNext(media)
-    }
-
-    /** `replace_next`: MA's queue then holds the current song and this one after it, and nothing else. */
-    private suspend fun sendNext(media: CastMedia) {
-        fun args(item: Any) = JSONObject().put("queue_id", queueId).put("media", JSONArray().put(item)).put("option", "replace_next")
-        fun address(m: CastMedia): Any = if (m.url.startsWith("http") && !m.live && !addressesOnly) builtinTrack(m) else m.url
-        val backup = media.fallbackUrl
-        val viaPhone = backup?.let { media.copy(url = it, fallbackUrl = null) }
-        try {
-            if (viaPhone != null && !media.url.startsWith("http") && !youTubeMusicFailed) {
-                try {
-                    client.call("player_queues/play_media", args(media.url))
-                    return
-                } catch (e: MaException) {
-                    if (e.signIn) throw e
-                    youTubeMusicFailed = true
-                }
+        if (positionMs >= SEEK_MIN_MS) scope.launch { seekWhenStarted(positionMs, before) }
+        for (batch in songs.drop(1).chunked(BATCH)) {
+            try {
+                send(batch, "add")
+            } catch (e: Exception) {
+                Log.w(TAG, "couldn't queue ${batch.size} songs on $name: ${e.message}")
+                if (e is MaException && e.signIn) break
             }
-            client.call("player_queues/play_media", args(address(viaPhone ?: media)))
-        } catch (e: Exception) {
-            // Without it, the speaker's own Next does nothing; the phone's Next still works.
-            Log.w(TAG, "couldn't queue the next song on $name: ${e.message}")
         }
     }
 
-    /** Where the song just sent should start, and whether paused, once MA's queue holds it. */
-    @Volatile private var startAt: Long? = null
-    /**
-     * Whether the phone last asked for it playing or paused. A seek waiting for MA, as a song
-     * starts, ends with a pause only if paused is still what's wanted: a pause decided when the
-     * song was sent paused the speaker after the phone had been played meanwhile.
-     */
-    @Volatile private var wantPlay = true
+    /** Adds [songs] to the queue: straight after the current song, or at the end. */
+    suspend fun add(songs: List<CastMedia>, next: Boolean) = command {
+        if (songs.isNotEmpty()) send(songs, if (next) "next" else "add")
+    }
 
-    /** The queue last said it was idle: stopped, with nothing to resume. */
-    @Volatile private var queueIdle = false
-
-    override suspend fun play() = command {
-        wantPlay = true
-        val media = loaded
-        // A stopped queue (an Echo Show stops rather than pauses) is resumed by MA from where it
-        // stopped, the server starting the stream there, so it works on a speaker that can't seek.
-        // Sending the song again started it from the top on such a speaker.
-        val resumed = try {
-            queue("player_queues/play")
-            true
+    /** `play_media` with [songs]: by YouTube Music's addresses first, then the phone's if MA can't play those. */
+    private suspend fun send(songs: List<CastMedia>, option: String) {
+        fun args(media: List<Any>) = JSONObject().put("queue_id", queueId).put("media", JSONArray(media)).put("option", option)
+        fun address(m: CastMedia): Any = if (m.url.startsWith("http") && !m.live && !addressesOnly) builtinTrack(m) else m.url
+        if (!youTubeMusicFailed && songs.any { it.fallbackUrl != null && !it.url.startsWith("http") }) {
+            try {
+                client.call("player_queues/play_media", args(songs.map(::address)))
+                return
+            } catch (e: MaException) {
+                if (e.signIn) throw e
+                // MA's YouTube Music couldn't play them (signed out, or turned away by YouTube): through the phone, then.
+                Log.w(TAG, "$name couldn't take ${songs.size} songs from YouTube Music (${e.message}); playing them through the phone")
+                youTubeMusicFailed = true
+                Cast.say(com.opentune.i18n.Tr.t("Music Assistant's YouTube Music couldn't play this, so songs play through this phone"))
+            }
+        }
+        val viaPhone = songs.map { s -> s.fallbackUrl?.let { s.copy(url = it, fallbackUrl = null) } ?: s }
+        try {
+            client.call("player_queues/play_media", args(viaPhone.map(::address)))
         } catch (e: MaException) {
-            if (e.signIn || !queueIdle || media == null) throw e
-            Log.w(TAG, "$name wouldn't resume (${e.message}); sending the song again")
-            false
-        }
-        if (!resumed && media != null) {
-            // Nothing left to resume: the song is sent again and moved to its place.
-            val at = _status.value.positionNow()
-            ourItem = null
-            itemBefore = currentItem
-            startAt = at.takeIf { it >= SEEK_MIN_MS }
-            playMedia(media)
+            if (e.signIn || addressesOnly || viaPhone.none { it.url.startsWith("http") && !it.live }) throw e
+            Log.w(TAG, "$name wouldn't take songs with their details (${e.message}); sending the addresses alone")
+            addressesOnly = true
+            client.call("player_queues/play_media", args(viaPhone.map { it.url }))
         }
     }
-    override suspend fun pause() = command {
-        wantPlay = false
-        queue("player_queues/pause")
+
+    /** Set once the server has turned down songs sent as whole tracks; addresses alone go from then on. */
+    @Volatile private var addressesOnly = false
+
+    /**
+     * Moves the song just handed over to [positionMs] once it's under way: MA turns a seek down
+     * (its catch-all "invalid command") until then. The place moves on with the time spent waiting.
+     */
+    private suspend fun seekWhenStarted(positionMs: Long, before: String?) {
+        val from = SystemClock.elapsedRealtime()
+        var started: String? = null
+        repeat(START_SEEK_TRIES) {
+            delay(START_SEEK_GAP_MS)
+            val now = _queue.value.itemId
+            if (now == null || now == before) return@repeat
+            // Moved on from the song handed over (skipped meanwhile): its place no longer matters.
+            if (started != null && now != started) return
+            started = now
+            if (seekTo(positionMs + SystemClock.elapsedRealtime() - from)) return
+        }
+    }
+
+    override suspend fun load(media: CastMedia, positionMs: Long, play: Boolean) {
+        handOff(listOf(media), positionMs)
+        if (!play) pause()
+    }
+
+    override suspend fun play() = command { queue("player_queues/play") }
+    override suspend fun pause() = command { queue("player_queues/pause") }
+    suspend fun next() = command { queue("player_queues/next") }
+    suspend fun previous() = command { queue("player_queues/previous") }
+
+    /** Plays the queue's song at [index], from [positionMs]. */
+    suspend fun playIndex(index: Int, positionMs: Long = 0) = command {
+        queue("player_queues/play_index", JSONObject().put("index", index).put("seek_position", positionMs / 1000))
+    }
+
+    override suspend fun seek(positionMs: Long) = command {
+        if (seekTo(positionMs)) _queue.value = _queue.value.copy(positionMs = positionMs, at = SystemClock.elapsedRealtime())
+    }
+
+    /** Takes the queue's song [itemId] out. */
+    suspend fun remove(itemId: String) = command { queue("player_queues/delete_item", JSONObject().put("item_id_or_index", itemId)) }
+
+    /** Moves the queue's song [itemId] [shift] places (later in the queue for more than 0). */
+    suspend fun move(itemId: String, shift: Int) = command {
+        queue("player_queues/move_item", JSONObject().put("queue_item_id", itemId).put("pos_shift", shift))
+    }
+
+    suspend fun shuffle(on: Boolean) = command { queue("player_queues/shuffle", JSONObject().put("shuffle_enabled", on)) }
+
+    /** [mode]: "off", "one" or "all". */
+    suspend fun repeat(mode: String) = command { queue("player_queues/repeat", JSONObject().put("repeat_mode", mode)) }
+
+    override suspend fun setVolume(level: Float) = command {
+        val percent = (level.coerceIn(0f, 1f) * 100).roundToInt()
+        client.call("players/cmd/volume_set", JSONObject().put("player_id", playerId).put("volume_level", percent))
+        _status.value = _status.value.copy(volume = percent / 100f)
     }
 
     /** Set once the player has turned a seek down as unsupported; none are sent after. */
     @Volatile private var cantSeek = false
 
     /**
-     * Moves the song to [positionMs]; false if MA turned it down. MA seeks by starting the
-     * stream again at the place, so any player can; it turns one down (12, its catch-all
-     * "invalid command") while the song isn't under way yet. That was taken as a player that
-     * can't seek, and a seek in a song's first moments turned seeking off for good.
+     * Moves the song to [positionMs]; false if MA turned it down. MA seeks by starting the stream
+     * again at the place, so any player can; it turns one down (12, "invalid command") while the
+     * song isn't under way yet, which is no reason to stop trying.
      */
     private suspend fun seekTo(positionMs: Long): Boolean {
         if (cantSeek) return false
@@ -560,7 +602,6 @@ class MusicAssistant(
             true
         } catch (e: MaException) {
             when (e.code) {
-                // An unsupported feature: so it stays.
                 9 -> { cantSeek = true; Log.w(TAG, "$name can't seek (${e.message})") }
                 12 -> Log.i(TAG, "$name turned a seek down for now (${e.message})")
                 else -> throw e
@@ -569,82 +610,16 @@ class MusicAssistant(
         }
     }
 
-    /**
-     * A seek as a song starts, tried again while MA isn't ready for it; while it's meant to be
-     * playing, the place moves on with the time spent waiting, as the phone's does.
-     */
-    private suspend fun seekOnceUnderWay(positionMs: Long, item: String?) {
-        val from = SystemClock.elapsedRealtime()
-        repeat(START_SEEK_TRIES) { attempt ->
-            if (attempt > 0) kotlinx.coroutines.delay(START_SEEK_GAP_MS)
-            if (cantSeek || ourItem != item) return
-            val waited = if (wantPlay) SystemClock.elapsedRealtime() - from else 0
-            if (seekTo(positionMs + waited)) return
-        }
-    }
-    override suspend fun seek(positionMs: Long) = command {
-        if (!seekTo(positionMs)) return@command
-        _status.value = _status.value.copy(positionMs = positionMs, at = SystemClock.elapsedRealtime())
-    }
-
-    override suspend fun setVolume(level: Float) = command {
-        val percent = (level.coerceIn(0f, 1f) * 100).roundToInt()
-        client.call("players/cmd/volume_set", JSONObject().put("player_id", playerId).put("volume_level", percent))
-        _status.value = _status.value.copy(volume = percent / 100f)
-    }
-
     override fun close() {
         listening?.cancel()
         scope.launch {
             runCatching { queue("player_queues/stop") }
-            autoplayWas?.let { was ->
-                runCatching { client.call("player_queues/dont_stop_the_music", JSONObject().put("queue_id", queueId).put("dont_stop_the_music_enabled", was)) }
-            }
             client.release()
             scope.cancel()
         }
     }
 
     private suspend fun queue(command: String, args: JSONObject = JSONObject()) = client.call(command, args.put("queue_id", queueId))
-
-    /** Set once the server has turned down a song sent as a whole track; addresses alone go from then on. */
-    @Volatile private var addressesOnly = false
-
-    /** Replaces what the player's queue holds with [media]. */
-    private suspend fun playMedia(media: CastMedia) {
-        fun args(item: Any) = JSONObject().put("queue_id", queueId).put("media", JSONArray().put(item)).put("option", "replace")
-        val backup = media.fallbackUrl
-        // Failed here once already (a song sent again after a stop, say): straight through the phone.
-        if (backup != null && !media.url.startsWith("http") && youTubeMusicFailed) {
-            return playMedia(media.copy(url = backup, fallbackUrl = null))
-        }
-        if (backup != null && !media.url.startsWith("http")) {
-            try {
-                client.call("player_queues/play_media", args(media.url))
-                return
-            } catch (e: MaException) {
-                if (e.signIn) throw e
-                // MA's YouTube Music couldn't play it (signed out, or turned away by YouTube): through the phone, then.
-                Log.w(TAG, "$name couldn't play ${media.title} from YouTube Music (${e.message}); playing it through the phone")
-                if (!youTubeMusicFailed) {
-                    youTubeMusicFailed = true
-                    Cast.say(com.opentune.i18n.Tr.t("Music Assistant's YouTube Music couldn't play this, so songs play through this phone"))
-                }
-                return playMedia(media.copy(url = backup, fallbackUrl = null))
-            }
-        }
-        if (media.url.startsWith("http") && !media.live && !addressesOnly) {
-            try {
-                client.call("player_queues/play_media", args(builtinTrack(media)))
-                return
-            } catch (e: MaException) {
-                if (e.signIn) throw e
-                Log.w(TAG, "$name wouldn't take ${media.title} with its details (${e.message}); sending the address alone")
-                addressesOnly = true
-            }
-        }
-        client.call("player_queues/play_media", args(media.url))
-    }
 
     private suspend fun command(block: suspend () -> Unit) = withContext(Dispatchers.IO) {
         runCatching { block() }.onFailure { Log.w(TAG, "command to $name failed: ${it.message}") }
@@ -661,9 +636,15 @@ class MusicAssistant(
                 _status.value = _status.value.copy(state = RemoteState.GONE, at = SystemClock.elapsedRealtime())
             }
             "queue_updated" -> if (e.objectId == queueId) (e.data as? JSONObject)?.let(::onQueue)
+            "queue_items_updated" -> if (e.objectId == queueId) {
+                (e.data as? JSONObject)?.let(::onQueue)
+                reloadItems()
+            }
             "queue_time_updated" -> if (e.objectId == queueId) (e.data as? Number)?.let { seconds ->
-                if (_status.value.state == RemoteState.LOADING) return
-                _status.value = _status.value.copy(positionMs = (seconds.toDouble() * 1000).toLong(), at = SystemClock.elapsedRealtime())
+                val q = _queue.value
+                if (q.state == "idle") return
+                _queue.value = q.copy(positionMs = (seconds.toDouble() * 1000).toLong(), at = SystemClock.elapsedRealtime())
+                updateStatus()
             }
         }
     }
@@ -677,99 +658,61 @@ class MusicAssistant(
         _status.value = _status.value.copy(volume = volume)
     }
 
-    private fun onQueue(q: JSONObject) {
-        val media = loaded
-        val current = q.optJSONObject("current_item")
-        val uri = current?.let(::uriOf)
-        val itemId = current?.optString("queue_item_id")?.ifBlank { null }
-        currentItem = itemId
-        // The speaker went from our song to another by itself: back to one sent before (its
-        // Previous), or on to the next one queued (its Next, or the end of the song). It's
-        // reported as playing that song, so the phone goes to it too, either way.
-        fun isSong(m: CastMedia) = uri == null || sameMedia(uri, m.url) || m.fallbackUrl?.let { sameMedia(uri, it) } == true
-        // Our song again as a new item (MA starting it over) is still ours, not the speaker moving on.
-        if (media != null && ourItem != null && itemId != null && itemId != ourItem && sent[itemId] == null && uri != null && isSong(media)) {
-            ourItem = itemId
-            sent[itemId] = media
-        }
-        // An item never seen before is the next song queued only if it is that song.
-        val moved = if (media != null && ourItem != null && itemId != null && itemId != ourItem) sent[itemId] ?: queuedNext?.takeIf(::isSong) else null
-        if (moved != null && movedTo?.first != itemId) {
-            Log.i(TAG, "$name went to another song by itself")
-            movedTo = itemId!! to moved
-            sent[itemId] = moved
-        }
-        // The song sent is the first new item to turn up, or one with its address.
-        if (media != null && ourItem == null && itemId != null && itemId != itemBefore) {
-            ourItem = itemId
-            sent[itemId] = media
-            // The song is in MA's queue now: it can be moved to its place, and paused if it should be,
-            // and the phone's next song put after it.
-            val startFrom = startAt
-            val next = queuedNext
-            startAt = null
-            if (startFrom != null || !wantPlay) scope.launch {
-                startFrom?.let { runCatching { seekOnceUnderWay(it, itemId) }.onFailure { e -> Log.w(TAG, "seek on $name failed: ${e.message}") } }
-                // A seek starts it playing again; paused only if that's still what's wanted.
-                if (!wantPlay) runCatching { queue("player_queues/pause") }
-            }
-            // Not held up by a seek waiting for MA.
-            next?.let { scope.launch { sendNext(it) } }
-        }
-        val ours = media != null && itemId != null && itemId == ourItem
-        val mediaId = when {
-            ours -> media!!.id
-            moved != null -> moved.id
-            uri != null -> uri
-            else -> media?.id
-        }
-        val state = when (q.optString("state")) {
-            "playing" -> if (ours || moved != null || media == null) RemoteState.PLAYING.also {
-                if (ours && !played && sentAt > 0) Log.i(TAG, "$name started ${media?.title} ${SystemClock.elapsedRealtime() - sentAt} ms after it was sent")
-                played = played || ours
-            } else RemoteState.LOADING
-            "paused" -> RemoteState.PAUSED
-            // Idle is the end of the song only when MA says so (`ended`), or, from a server
-            // without that flag, when it stopped in the song's last seconds. Otherwise it was
-            // stopped: many players stop rather than pause, and that was taken as the end,
-            // so pausing skipped the song. It's held as paused, where it stopped.
-            "idle" -> when {
-                media != null && played && (ours || current == null) && (q.optBoolean("ended") || !q.has("ended") && nearEnd(media)) -> RemoteState.FINISHED
-                media != null && played && ours -> RemoteState.PAUSED
-                _status.value.state == RemoteState.LOADING -> RemoteState.LOADING
-                else -> RemoteState.IDLE
-            }
-            else -> _status.value.state
-        }
-        queueIdle = q.optString("state") == "idle"
-        val finished = media != null && ours && q.optBoolean("ended")
-        val at = SystemClock.elapsedRealtime()
-        // elapsed_time is as of elapsed_time_last_updated, in the server's unix seconds.
+    internal fun onQueue(q: JSONObject) {
+        val old = _queue.value
+        val now = SystemClock.elapsedRealtime()
+        val state = q.optString("state").ifBlank { "idle" }
+        val itemId = q.optJSONObject("current_item")?.optString("queue_item_id")?.ifBlank { null }
         val elapsed = (q.optDouble("elapsed_time", 0.0) * 1000).toLong()
-        val since = q.optDouble("elapsed_time_last_updated", 0.0).takeIf { it > 0 }?.let { (System.currentTimeMillis() - it * 1000).toLong().coerceIn(0, 10_000) } ?: 0
-        val position = if (state == RemoteState.PLAYING) elapsed + since else elapsed
+        // elapsed_time is as of elapsed_time_last_updated, in the server's unix seconds.
+        val since = q.optDouble("elapsed_time_last_updated", 0.0).takeIf { it > 0 }
+            ?.let { (System.currentTimeMillis() - it * 1000).toLong().coerceIn(0, 10_000) } ?: 0
+        // A stopped queue (an Echo Show stops rather than pauses) reports 0:00; the song is held where it was.
+        val stoppedHere = state == "idle" && elapsed == 0L && itemId != null && itemId == old.itemId
+        _queue.value = MaQueue(
+            state = state,
+            index = if (q.isNull("current_index")) -1 else q.optInt("current_index", -1),
+            itemId = itemId,
+            positionMs = if (stoppedHere) old.positionNow(now) else if (state == "playing") elapsed + since else elapsed,
+            at = now,
+            shuffle = q.optBoolean("shuffle_enabled"),
+            repeat = q.optString("repeat_mode").ifBlank { "off" },
+            count = q.optInt("items", _items.value.size),
+        )
+        // Songs it has that aren't read yet (or no longer has): read again.
+        if (q.has("items") && q.optInt("items") != _items.value.size || itemId != null && _items.value.none { it.id == itemId }) reloadItems()
+        updateStatus()
+    }
+
+    /** The queue as the cast sheet sees it. */
+    private fun updateStatus() {
+        val q = _queue.value
+        val item = _items.value.firstOrNull { it.id == q.itemId }
         _status.value = RemoteStatus(
-            state = if (finished) RemoteState.FINISHED else state,
-            // A stopped queue reports 0:00; the song is held where it was.
-            positionMs = if (state == RemoteState.LOADING || queueIdle && state == RemoteState.PAUSED) _status.value.positionNow(at) else position,
-            at = at,
+            state = when {
+                _status.value.state == RemoteState.GONE -> RemoteState.GONE
+                q.state == "playing" -> RemoteState.PLAYING
+                q.state == "paused" -> RemoteState.PAUSED
+                else -> RemoteState.IDLE
+            },
+            positionMs = q.positionMs,
+            at = q.at,
             volume = _status.value.volume,
-            mediaId = mediaId,
+            mediaId = item?.youTubeId ?: item?.uri,
         )
     }
 
-    /** Whether the loaded song was last seen in its final seconds. */
-    private fun nearEnd(media: CastMedia): Boolean =
-        media.durationMs > 0 && _status.value.positionNow() >= media.durationMs - END_MS
-
     companion object {
         private const val TAG = "Cast"
-        private const val SEEK_MIN_MS = 1_000L
-        /** How often, and how far apart, a seek as a song starts is tried while MA isn't ready for it. */
-        private const val START_SEEK_TRIES = 5
+        /** How far into a song the phone must be for it to start there on the speaker: a seek starts MA's stream over. */
+        private const val SEEK_MIN_MS = 5_000L
+        private const val START_SEEK_TRIES = 8
         private const val START_SEEK_GAP_MS = 1_000L
-        /** How near its end a song that stops counts as finished, on a server that doesn't say. */
-        private const val END_MS = 5_000L
+        /** How many songs go in each `play_media` after the first. */
+        private const val BATCH = 25
+        /** How many of the queue's songs are read. */
+        private const val ITEMS_MAX = 500
+        private const val ITEMS_SETTLE_MS = 300L
 
         /** How a YouTube song is handed to MA's YouTube Music provider, which fetches it itself. */
         fun youTubeUri(videoId: String, provider: String = "ytmusic") = "$provider://track/$videoId"
@@ -784,6 +727,29 @@ class MusicAssistant(
             .filter { it.optString("domain").startsWith("ytmusic") && it.optBoolean("available", true) }
             .sortedBy { if (it.optString("domain") == "ytmusic") 0 else 1 }
             .firstNotNullOfOrNull { p -> p.optString("instance_id").ifBlank { null } ?: p.optString("domain").ifBlank { null } }
+
+        /** The YouTube id in a YouTube Music provider's address (`ytmusic_free--a1b2://track/<id>`), or null. */
+        internal fun youTubeIdOf(uri: String?): String? =
+            uri?.let { Regex("^ytmusic[a-z_]*(--[^:/]+)?://track/([A-Za-z0-9_-]{11})$").find(it) }?.groupValues?.get(2)
+
+        /** A queue item as MA lists it. */
+        internal fun itemOf(item: JSONObject): MaItem? {
+            val id = item.optString("queue_item_id").ifBlank { null } ?: return null
+            val track = item.optJSONObject("media_item")
+            val artists = track?.optJSONArray("artists")
+            val image = item.optJSONObject("image")?.optString("path")
+                ?: track?.optJSONObject("metadata")?.optJSONArray("images")?.optJSONObject(0)?.optString("path")
+            val seconds = item.optDouble("duration", 0.0).takeIf { it > 0 } ?: track?.optDouble("duration", 0.0) ?: 0.0
+            return MaItem(
+                id = id,
+                uri = uriOf(item),
+                title = track?.optString("name")?.ifBlank { null } ?: item.optString("name"),
+                artist = artists?.let { a -> (0 until a.length()).mapNotNull { a.optJSONObject(it)?.optString("name")?.ifBlank { null } } }.orEmpty().joinToString(", "),
+                album = track?.optJSONObject("album")?.optString("name")?.ifBlank { null },
+                imageUrl = image?.takeIf { it.startsWith("http") },
+                durationMs = (seconds * 1000).toLong(),
+            )
+        }
 
         /**
          * A song played from an address, as a whole track for MA's built-in provider. Given
@@ -809,12 +775,6 @@ class MusicAssistant(
                     .put("type", "thumb").put("path", image).put("provider", "builtin").put("remotely_accessible", true))))
             }
             return track
-        }
-
-        internal fun autoplayOf(q: JSONObject): Boolean? = when {
-            q.has("dont_stop_the_music_enabled") -> q.optBoolean("dont_stop_the_music_enabled")
-            q.has("autoplay_enabled") -> q.optBoolean("autoplay_enabled")
-            else -> null
         }
 
         /** The URI of a queue item, from its media item (or MA's own link for it). */

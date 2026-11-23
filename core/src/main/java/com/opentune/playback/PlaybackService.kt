@@ -116,6 +116,10 @@ class PlaybackService : MediaLibraryService() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
     private var castMirror: CastMirror? = null
+    /** The phone's own player; the session's, except while a Music Assistant speaker has the queue. */
+    private var localPlayer: ExoPlayer? = null
+    /** The session's player while a Music Assistant speaker has the queue. */
+    private var maPlayer: MusicAssistantPlayer? = null
     private var radioJob: Job? = null
     private var radioSeed: String? = null
     /** The radio job is waiting before its next round, so a connection coming back can start it at once. */
@@ -521,11 +525,19 @@ class PlaybackService : MediaLibraryService() {
             },
         ).also { it.start() }
         dsp.meter = true
-        // Casting: the device follows this player while one is connected.
+        // Casting: the device follows this player while one is connected; a Music Assistant
+        // speaker takes the queue over instead, and the session shows the speaker (handOff).
         castMirror = CastMirror(context, player, scope)
+        localPlayer = player
         scope.launch {
             com.opentune.cast.Cast.session.map { it?.receiver }.distinctUntilChanged().collect { r ->
-                if (r != null) castMirror?.attach(r) else castMirror?.detach()
+                if (r is com.opentune.cast.MusicAssistant) {
+                    castMirror?.detach(resume = false)
+                    handOff(r)
+                } else {
+                    handBack()
+                    if (r != null) castMirror?.attach(r) else castMirror?.detach()
+                }
             }
         }
         scope.launch {
@@ -767,6 +779,7 @@ class PlaybackService : MediaLibraryService() {
     }
 
     override fun onDestroy() {
+        handBack(resume = false)
         ExternalStreams.playing(null, null)
         (mediaSession?.player as? ExoPlayer)?.takeIf { it.mediaItemCount > 0 }?.let { p ->
             QueueStore.save(QueueStore.Saved((0 until p.mediaItemCount).map { SongRef.of(p.getMediaItemAt(it).toSong()) }, p.currentMediaItemIndex, p.currentPosition))
@@ -953,6 +966,62 @@ class PlaybackService : MediaLibraryService() {
                 .setSlots(CommandButton.SLOT_OVERFLOW)
                 .build(),
         )
+    }
+
+    /**
+     * Gives the queue to the Music Assistant speaker [r], which keeps it from then on: the phone's
+     * songs if it's playing (or the speaker has nothing of its own), held until played if it's
+     * paused, or else the speaker's own (joining what it plays). The phone's player stops, and the
+     * session's player shows the speaker, so the app, the notification and the volume keys drive it.
+     */
+    private fun handOff(r: com.opentune.cast.MusicAssistant) {
+        val local = localPlayer ?: return
+        val session = mediaSession ?: return
+        handBack(resume = false)
+        val speaker = MusicAssistantPlayer(r, scope) { item, lookUpNow -> com.opentune.cast.Cast.mediaFor(this, item, r, lookUpNow) }
+        val songs = (0 until local.mediaItemCount).map(local::getMediaItemAt)
+        val speakerBusy = r.queue.value.state != "idle" && r.items.value.isNotEmpty()
+        when {
+            songs.isEmpty() -> Unit
+            local.playWhenReady -> speaker.handOff(songs, local.currentMediaItemIndex, local.currentPosition)
+            speakerBusy -> Log.i(TAG, "${r.name} is playing already; joining its queue")
+            else -> speaker.stage(songs, local.currentMediaItemIndex, local.currentPosition)
+        }
+        local.pause()
+        maPlayer = speaker
+        session.player = speaker
+        refreshButtons()
+    }
+
+    /**
+     * Takes the queue back from the Music Assistant speaker: the phone goes to the speaker's song
+     * and place, in its own queue if the song is there, or else in the speaker's, and plays on if
+     * the speaker was playing and [resume].
+     */
+    private fun handBack(resume: Boolean = true) {
+        val speaker = maPlayer ?: return
+        maPlayer = null
+        val local = localPlayer
+        val playing = speaker.playWhenReady
+        val current = speaker.currentMediaItem
+        val position = speaker.currentPosition
+        val songs = (0 until speaker.mediaItemCount).map(speaker::getMediaItemAt)
+        mediaSession?.player = local ?: speaker
+        speaker.release()
+        refreshButtons()
+        // Only a song the phone can play itself; one from another of the speaker's services can't.
+        if (local == null || current?.localConfiguration == null) return
+        val here = (0 until local.mediaItemCount)
+            .filter { local.getMediaItemAt(it).mediaId == current.mediaId }
+            .minByOrNull { kotlin.math.abs(it - local.currentMediaItemIndex) }
+        if (here != null) {
+            local.seekTo(here, position)
+        } else {
+            val playable = songs.filter { it.localConfiguration != null }
+            local.setMediaItems(playable, playable.indexOf(current).coerceAtLeast(0), position)
+        }
+        if (local.playbackState == Player.STATE_IDLE) local.prepare()
+        if (resume && playing) local.play()
     }
 
     private fun refreshButtons() {
@@ -2339,6 +2408,8 @@ class PlaybackService : MediaLibraryService() {
      * new device the moment it appears, so this doesn't start on the speaker.
      */
     private fun resumeOnConnect() {
+        // The phone's own output connecting has nothing to do with a speaker that has the queue.
+        if (maPlayer != null) return
         val player = mediaSession?.player ?: return
         if (!AppSettings.playback.value.resumeOnConnect || player.mediaItemCount == 0 || player.playWhenReady) return
         Log.i(TAG, "Output device connected; resuming")
@@ -2360,6 +2431,8 @@ class PlaybackService : MediaLibraryService() {
     }
 
     private fun onMusicVolume() {
+        // The volume keys move the speaker's volume then, not the phone's.
+        if (maPlayer != null) return
         val player = mediaSession?.player ?: return
         val volume = audioManager?.getStreamVolume(AudioManager.STREAM_MUSIC) ?: return
         if (!AppSettings.playback.value.pauseAtZeroVolume) {
