@@ -59,7 +59,17 @@ android {
         debug {
             applicationIdSuffix = ".dev"
         }
+        // LOCAL ONLY: the same "OpenTune Dev" app at release speed, for trying changes on a phone.
+        // The debug build is debuggable, so Android runs it largely unoptimised and it lags.
+        create("dev") {
+            initWith(getByName("release"))
+            applicationIdSuffix = ".dev"
+            signingConfig = signingConfigs.getByName("debug")
+            matchingFallbacks += listOf("release")
+        }
     }
+    // LOCAL ONLY: the dev build is named as the debug one is.
+    sourceSets.getByName("dev").res.srcDir("src/debug/res")
 
     // One APK per processor type, so each is a third of the size, plus one
     // that runs anywhere.
